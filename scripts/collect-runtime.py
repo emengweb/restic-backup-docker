@@ -54,6 +54,7 @@ def excluded(path):
     return (any(x in {'__pycache__', 'bitcode', 'pgxs'} for x in p.parts)
             or p.name.endswith(('.pyc', '.pyo', '.a', '.bc'))
             or p.name.startswith(('llvmjit', 'libLLVM', 'libz3', 'libgalera'))
+            or path in {'/etc/ssl/certs/ssl-cert-snakeoil.pem', '/etc/ssl/private/ssl-cert-snakeoil.key'}
             or path.startswith('/usr/lib/python3.11/test/'))
 
 
@@ -129,6 +130,10 @@ class Collector:
         if excluded(path) or profile_excluded(path, self.profile):
             return
         resolved, links = self.resolve(path)
+        # Drop aliases to generated build-only material before recording any link.
+        # Hashed snakeoil symlink names vary per builder; CA symlinks are retained.
+        if excluded(resolved) or profile_excluded(resolved, self.profile):
+            return
         for link, info, target in links:
             self.record(link, info, target)
         info = self.source(resolved).lstat()

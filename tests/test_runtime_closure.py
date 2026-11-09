@@ -77,6 +77,32 @@ class FilesystemTests(unittest.TestCase):
         self.assertEqual(entry['bytes'], 7)
         self.assertNotIn('/usr/share/k3s-restic/runtime-files.json', [e['path'] for e in inventory['files']])
 
+    def test_generated_snakeoil_and_hash_alias_excluded_but_CA_preserved(self):
+        self.file("/etc/ssl/certs/ssl-cert-snakeoil.pem", b"synthetic-random-build-certificate")
+        self.file("/etc/ssl/certs/fixture-CA.pem", b"synthetic-trusted-ca")
+        (self.source / "etc/ssl/certs/a1b2c3d4.0").symlink_to("ssl-cert-snakeoil.pem")
+        (self.source / "etc/ssl/certs/f00dcafe.0").symlink_to("fixture-CA.pem")
+        self.c.add("/etc/ssl/certs", tree=True)
+        self.c.materialize(self.output)
+        self.assertFalse((self.output / "etc/ssl/certs/ssl-cert-snakeoil.pem").exists())
+        self.assertFalse((self.output / "etc/ssl/certs/a1b2c3d4.0").is_symlink())
+        self.assertEqual((self.output / "etc/ssl/certs/fixture-CA.pem").read_bytes(), b"synthetic-trusted-ca")
+        self.assertTrue((self.output / "etc/ssl/certs/f00dcafe.0").is_symlink())
+
+    def test_independent_build_random_certificates_do_not_change_runtime_inventory(self):
+        inventories = []
+        for suffix in ["one", "two"]:
+            source = self.base / suffix; source.mkdir()
+            certs = source / "etc/ssl/certs"; certs.mkdir(parents=True)
+            (certs / "ssl-cert-snakeoil.pem").write_text("synthetic-random-" + suffix)
+            (certs / (suffix + ".0")).symlink_to("ssl-cert-snakeoil.pem")
+            (certs / "fixture-CA.pem").write_text("synthetic-stable-ca")
+            c = module.Collector(source, ldd=lambda p,r: [])
+            c.add("/etc/ssl/certs", tree=True)
+            out = self.base / (suffix + "-out"); c.materialize(out)
+            inventories.append(json.loads((out / "usr/share/k3s-restic/runtime-files.json").read_text()))
+        self.assertEqual(inventories[0], inventories[1])
+
     def test_absolute_symlink_stays_inside_source(self):
         self.file('/usr/lib/libfoo.so', b'source-not-host')
         (self.source / 'lib').symlink_to('/usr/lib')
