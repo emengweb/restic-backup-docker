@@ -2,7 +2,7 @@
 
 基于 restic 的文件备份、原生数据库导出和空卷自动恢复工具，适合 Kubernetes/K3s 的 **恢复 initContainer + 定时备份 sidecar**。运行时使用 Python 3.11 标准库；数据库不是手写 SQL 导出，也不把运行中的数据目录拷贝冒充一致性备份。
 
-> **当前公开版本：v2.0.3。** all/lite 均已完成原生 amd64、arm64 CI、真实合成恢复 E2E、共享层检查、GHCR 发布和签名验证。**发布成功不等于你的生产仓库、存储或数据库版本已经通过恢复验收。** 旧脚本命令不能仅换 image 后继续沿用。
+> **当前公开版本：v2.0.4。** all/lite 均已完成原生 amd64、arm64 CI、真实合成恢复 E2E、共享层检查、GHCR 发布和签名验证。**发布成功不等于你的生产仓库、存储或数据库版本已经通过恢复验收。** 旧脚本命令不能仅换 image 后继续沿用。
 
 ## 1. 镜像、版本和架构
 
@@ -10,8 +10,8 @@
 
 | 变体 | 标签 | 用途 |
 | --- | --- | --- |
-| **all，默认完整版** | `v2.0.3`、`v2.0.3-all`、`latest` | 文件 + PG16/17 + MariaDB11.8 原生工具 |
-| **lite，可选精简版** | `v2.0.3-lite`、`lite` | 文件/restic 自动化；没有数据库工具 |
+| **all，默认完整版** | `v2.0.4`、`v2.0.4-all`、`latest` | 文件 + PG16/17 + MariaDB11.8 原生工具 |
+| **lite，可选精简版** | `v2.0.4-lite`、`lite` | 文件/restic 自动化；没有数据库工具 |
 
 两种变体均提供 `linux/amd64`、`linux/arm64`，共享同架构的 lite/files 基础层。lite 不是仅有 restic 二进制的官方原始镜像，仍包含 Python 调度、恢复和维护防护。内部 `files` 是共同基础层，不是第三个公开产品。
 
@@ -28,13 +28,13 @@ PostgreSQL JIT/LLVM 与 Galera 未装入精简运行层；恢复 helper 禁用 J
 ### 固定已验证的多架构 index digest
 
 ```text
-# all：v2.0.3 / v2.0.3-all / latest 在该次发布时指向同一 index
-ghcr.io/emengweb/restic-backup-docker@sha256:9c89dd3089c91db13266b7617604199f031f763f060cf7e0aae2020b3354d2bc
-# lite：v2.0.3-lite / lite
-ghcr.io/emengweb/restic-backup-docker@sha256:4540ed02748ae1ea04db3971019e01d3d7e1cb51b2ce60f872fa5058ddb7e0aa
+# all：v2.0.4 / v2.0.4-all / latest 在该次发布时指向同一 index
+ghcr.io/emengweb/restic-backup-docker@sha256:52c23fa4bd6fa439a4b8e358edc01113aa45337402452e90dff38a388b69f22f
+# lite：v2.0.4-lite / lite
+ghcr.io/emengweb/restic-backup-docker@sha256:16059ef22add33989b495593e754103b7daf6ecdafe5f14e423d4c97238000ed
 ```
 
-生产建议固定 index digest，而不是跟随可移动的 `latest`/`lite`。默认无标签 pull 的 `latest` 指 all，不会偷偷改成 lite。v2.0.2 失败流程留下的架构级上传不是完整发布，不应使用。发布与验证：[v2.0.3 release](<https://github.com/emengweb/restic-backup-docker/releases/tag/v2.0.3>)、[成功 CI](<https://github.com/emengweb/restic-backup-docker/actions/runs/42570334098>)；供应链流程见[发布 CI 说明](<docs/PROFILE-CI.md>)及[GHCR 实战经验](<docs/GHCR-PUBLISHING-LESSONS.md>)。
+生产建议固定 index digest，而不是跟随可移动的 `latest`/`lite`。默认无标签 pull 的 `latest` 指 all，不会偷偷改成 lite。v2.0.2 失败流程留下的架构级上传不是完整发布，不应使用。发布与验证：[v2.0.4 release](<https://github.com/emengweb/restic-backup-docker/releases/tag/v2.0.4>)、[成功 CI](<https://github.com/emengweb/restic-backup-docker/actions/runs/42591903536>)；供应链流程见[发布 CI 说明](<docs/PROFILE-CI.md>)及[GHCR 实战经验](<docs/GHCR-PUBLISHING-LESSONS.md>)。
 
 ## 2. “客户端能导出”不等于“可以交回原版本主数据库”
 
@@ -49,7 +49,7 @@ ghcr.io/emengweb/restic-backup-docker@sha256:4540ed02748ae1ea04db3971019e01d3d7e
 | MariaDB 自动恢复 | helper 是 **11.8.9**，生成 11.8 datadir。**不能交给未升级的 11.5 主容器启动**；MySQL 不因 mysql 环境别名而获得支持 |
 | MariaDB 物理模式 | 当前未实现；即使镜像带 `mariadb-backup`，也不会声称物理模式可用 |
 
-已执行的本项目合成容器恢复证据覆盖 PG16.15、PG17.11 和 MariaDB11.8.9，以及 pgvector0.8.2 SQL 身份；这不代表所有旧源版本/应用都通过验收。PG 源 14 → 目标 17 是一次明确的逻辑迁移，不是“换备份 sidecar 后自动兼容 PG14”。源/目标 libc、locale、编码、collation、扩展安装 SQL/版本、owner/GRANT、主镜像 UID/GID 均需单独验收。pgvector0.8.2 SQL 存在不代表任意旧扩展都能恢复；自定义扩展 schema、外部 tablespace 等可能直接拒绝。
+已执行的本项目合成容器恢复证据覆盖 PG16.15、PG17.11 和 MariaDB11.8.9，以及 pgvector0.8.2 SQL 身份；v2.0.4 增加无 passwd 条目目标 UID70 的真实双架构恢复/重启/读写/关闭用例，并用真实 Blinko 快照在异节点恢复后由原 Alpine 固定镜像续启通过。详见[UID 交接与验收](<docs/POSTGRES-UID-HANDOFF.md>)；这不代表所有旧源版本/应用都通过验收。PG 源 14 → 目标 17 是一次明确的逻辑迁移，不是“换备份 sidecar 后自动兼容 PG14”。源/目标 libc、locale、编码、collation、扩展安装 SQL/版本、owner/GRANT、主镜像 UID/GID 均需单独验收。pgvector0.8.2 SQL 存在不代表任意旧扩展都能恢复；自定义扩展 schema、外部 tablespace 等可能直接拒绝。
 
 PG 每个库各自有一致快照，globals 单独捕获；多个库不是分布式同一事务点。MariaDB 数据库集合使用单次事务，但 globals 也独立。并发 DDL 和应用跨库业务一致性仍须写入冻结/应用协作。SQLite/WAL、KeyDB、MinIO 等不能靠热目录文件复制宣称一致，请先停写/使用应用原生备份与一致性 hook。
 
@@ -88,7 +88,7 @@ PG 每个库各自有一致快照，globals 单独捕获；多个库不是分布
 | `DATABASE_HOST/PORT/USER/NAME/PASSWORD[_FILE]` | `DATABASE_NAME` 为显式逗号分隔库列表；同 Pod sidecar 通常连 `127.0.0.1` |
 | `RESTORE_TARGET_MAJOR` | 恢复目标；优先于 `TARGET_DATABASE_MAJOR`、`DATABASE_MAJOR`、`PG_MAJOR`。PG16/17 或 Maria11.8 |
 | `BACKUP_MODE` | 数据库默认 logical；PG 可选 physical、dual。dual 仅两条流都完成才记整体成功 |
-| `DB_UID/DB_GID` | 恢复生成目录的主数据库数字 UID/GID，应匹配实际主镜像，不要盲用默认 |
+| `DB_UID/DB_GID` | 最终数据目录数字 UID/GID，应匹配主镜像。v2.0.4 的 PG 逻辑恢复先用可解析 helper 账户执行，完整校验/干净关闭后交接最终 owner；已验证 999→70。MariaDB/PG 物理模式不因该修复自动扩展 |
 | `DATASET_ID`、`REPOSITORY_ISOLATED` | 默认独立仓库模式，identity 由仓库地址摘要生成；共享仓库必须显式稳定 ID |
 | `BACKUP_CRON` | 默认 `0 */6 * * *`；迁移时保留每个项目原值，不统一改频率 |
 | `CHECK_CRON`、`PRUNE_CRON` | 默认为空，不调度对应任务 |
@@ -136,7 +136,7 @@ spec:
       automountServiceAccountToken: false
       initContainers:
         - name: restore-data
-          image: ghcr.io/emengweb/restic-backup-docker@sha256:4540ed02748ae1ea04db3971019e01d3d7e1cb51b2ce60f872fa5058ddb7e0aa
+          image: ghcr.io/emengweb/restic-backup-docker@sha256:16059ef22add33989b495593e754103b7daf6ecdafe5f14e423d4c97238000ed
           command: ["python3", "-m", "k3s_backup"]
           args: ["restore-init"]
           envFrom:
@@ -166,7 +166,7 @@ spec:
       containers:
         # 原应用容器仍在此数组中，并挂载同一个 app-data；这里省略其原有定义。
         - name: backup
-          image: ghcr.io/emengweb/restic-backup-docker@sha256:4540ed02748ae1ea04db3971019e01d3d7e1cb51b2ce60f872fa5058ddb7e0aa
+          image: ghcr.io/emengweb/restic-backup-docker@sha256:16059ef22add33989b495593e754103b7daf6ecdafe5f14e423d4c97238000ed
           command: ["python3", "-m", "k3s_backup"]
           args: ["schedule"]
           envFrom:
@@ -231,4 +231,4 @@ python3 tests/container_e2e.py --help
 
 原生容器 E2E 仅用于已审查、已修补 runtime 的独立测试 daemon，必须显式选择 daemon/image/runtime/profile；不挂生产数据、密钥或 Docker socket，不把 skipped/NOT RUN 算通过。CI 对 all/lite × amd64/arm64 四种组合都执行实际测试，然后发布同一已测镜像归档，不在发布阶段重建。
 
-仓库保留上游许可证，见[LICENSE](<LICENSE>)。版本化下载、文件闭包和签名证据见[发布说明](<docs/RELEASE-v2.0.3.md>)、[发布 CI](<docs/PROFILE-CI.md>)、[GHCR 实战经验](<docs/GHCR-PUBLISHING-LESSONS.md>)。旧 Node dump/自动 restic init/不受控 restore latest 到 `/` 的历史用法不属于当前使用合同。
+仓库保留上游许可证，见[LICENSE](<LICENSE>)。版本化下载、文件闭包和签名证据见[发布说明](<docs/RELEASE-v2.0.4.md>)、[发布 CI](<docs/PROFILE-CI.md>)、[GHCR 实战经验](<docs/GHCR-PUBLISHING-LESSONS.md>)。旧 Node dump/自动 restic init/不受控 restore latest 到 `/` 的历史用法不属于当前使用合同。

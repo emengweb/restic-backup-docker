@@ -4,7 +4,7 @@
 
 This change applies only to PostgreSQL **logical** restore. MariaDB and native/legacy PostgreSQL physical paths retain their previous identity handling; do not claim this handoff has adapted them.
 
-Local synthetic engine tests: **52 passed**, Python syntax checks passed. The hosted CI numeric-UID70 native database case and real source-specific Alpine continuation are **NOT RUN / pending Lead verification** at this handoff. No production rollout, Kubernetes mutation, container execution, commit or push was performed by this task. An older published image does not gain this feature without a new tested build.
+验收更新（2026-11-09）：52 项引擎单测及 249 项全量测试通过；[main 原生 CI](https://github.com/emengweb/restic-backup-docker/actions/runs/42591117929) 与 [v2.0.4 发布 CI](https://github.com/emengweb/restic-backup-docker/actions/runs/42591903536) 的 amd64/arm64 数值 UID70 恢复、目标目录续启、读写和干净关闭全部通过。真实 Blinko 原生快照在另一个节点空卷恢复后，原 PostgreSQL17 Alpine 固定 digest 以 UID70 启动，认证、UTF8/locale、28表/49索引/21序列/56约束/plpgsql1.0匹配；正式替换后实际侧车新快照再次完成相同验证。该结果只证明此实例，不外推所有 Alpine/扩展。旧镜像不会因源码修复自动具备功能，需使用已测试的新 digest。
 
 ## Why final DB_UID=70 cannot be the initdb execution identity
 
