@@ -172,6 +172,35 @@ def _identity(config, engine):
     return uid, gid
 
 
+def _pg_restore_identities(config):
+    """PG initdb needs an NSS identity; the final numeric owner does not."""
+    try:
+        if os.geteuid() == 0:
+            account = pwd.getpwnam("postgres")
+            helper = (account.pw_uid, account.pw_gid)
+        else:
+            account = pwd.getpwuid(os.geteuid())
+            helper = (os.geteuid(), os.getegid())
+    except KeyError:
+        _fail("database_identity", "The PostgreSQL helper requires a resolvable non-root OS account")
+    if not account.pw_name or any(type(n) is not int or n <= 0 or n >= 2**32 - 1 for n in helper):
+        _fail("database_identity", "The PostgreSQL helper account has an invalid UID or GID")
+    env = _env(config)
+    requested = []
+    for generic, alias, default in (("DB_UID", "POSTGRES_UID", helper[0]), ("DB_GID", "POSTGRES_GID", helper[1])):
+        raw = env.get(generic, env.get(alias, str(default)))
+        if not isinstance(raw, str) or not re.fullmatch(r"[0-9]{1,10}", raw):
+            _fail("database_identity", "The requested database UID and GID must be positive numeric IDs")
+        value = int(raw)
+        if value <= 0 or value >= 2**32 - 1:
+            _fail("database_identity", "The requested database UID or GID is outside its supported range")
+        requested.append(value)
+    final = tuple(requested)
+    if os.geteuid() != 0 and final != helper:
+        _fail("database_identity", "A non-root helper cannot hand database files to a different UID or GID")
+    return helper, final
+
+
 def _as_database(config, argv, identity, *, parent_death=False):
     prefix = [_binary(config, "SETPRIV_BIN", "/usr/bin/setpriv")] if os.geteuid() == 0 or parent_death else []
     if os.geteuid() == 0:
@@ -182,9 +211,9 @@ def _as_database(config, argv, identity, *, parent_death=False):
 
 
 @contextmanager
-def _database_access(config, target, engine):
+def _database_access(config, target, engine, *, identity=None):
     """Grant group traversal only inside the restore module's owned stage."""
-    identity = _identity(config, engine)
+    identity = _identity(config, engine) if identity is None else identity
     parent = target.parent
     originals = []
     owned = re.fullmatch(r"\.k3s-restic-stage-[a-f0-9]{32}", parent.name)
@@ -228,6 +257,180 @@ def _runtime_dir(identity):
     finally:
         # This randomly-created, never-published directory is our only rmtree.
         shutil.rmtree(path)
+
+
+def _handoff_mount_id(fd):
+    try:
+        with open("/proc/self/fdinfo/" + str(fd), encoding="ascii") as stream:
+            for line in stream:
+                if line.startswith("mnt_id:"):
+                    return int(line.split(":", 1)[1])
+    except (OSError, ValueError):
+        pass
+    _fail("database_handoff_mount", "Cannot verify database handoff mount boundaries")
+
+
+def _handoff_open_target(target):
+    path = Path(target)
+    if not path.is_absolute() or ".." in path.parts:
+        _fail("database_handoff_path", "Database handoff target must be an absolute validated directory")
+    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for part in path.parts[1:]:
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _handoff_database_owner(target, helper, final, expected, *, clean_shutdown):
+    """Transfer only the pinned, newly-restored PG payload after clean shutdown.
+
+    Preflight the entire tree before any chown. Every later open is relative to
+    the pinned root, no-follow, rechecked by inode/mount/owner. No path deletion,
+    shell, source archive, runtime socket, parent or journal is involved.
+    """
+    if not clean_shutdown:
+        _fail("database_handoff_active", "Database ownership cannot change before verified clean shutdown")
+    if helper == final:
+        return
+    if os.geteuid() != 0:
+        _fail("database_identity", "Changing the final database UID or GID requires a root helper")
+    root = None
+    try:
+        root = _handoff_open_target(target)
+        initial = os.fstat(root)
+        if (initial.st_dev, initial.st_ino) != expected:
+            _fail("database_handoff_identity", "The database handoff target changed identity")
+        mount = _handoff_mount_id(root)
+        for marker in ("postmaster.pid", "server.pid"):
+            try:
+                os.stat(marker, dir_fd=root, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            _fail("database_handoff_active", "Database process markers must be absent before ownership handoff")
+        records = []
+
+        def validate(fd, relative):
+            info = os.fstat(fd)
+            if info.st_dev != initial.st_dev or _handoff_mount_id(fd) != mount:
+                _fail("database_handoff_mount", "Database ownership handoff cannot cross a mount boundary")
+            if (info.st_uid, info.st_gid) != helper:
+                _fail("database_handoff_owner", "Database handoff found an unexpected filesystem owner")
+            directory = stat.S_ISDIR(info.st_mode)
+            if not directory and (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1):
+                _fail("unsafe_database_tree", "Database handoff requires only unlinked regular files and real directories")
+            if len(relative) > 64 or len(records) >= 100000:
+                _fail("database_handoff_limit", "Database handoff exceeded the bounded tree traversal limit")
+            records.append((relative, info.st_dev, info.st_ino, stat.S_IMODE(info.st_mode), directory))
+            if directory:
+                names = os.listdir(fd)
+                if len(names) > 100000 - len(records):
+                    _fail("database_handoff_limit", "Database handoff exceeded the bounded entry limit")
+                for name in names:
+                    s = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                    if not (stat.S_ISDIR(s.st_mode) or stat.S_ISREG(s.st_mode)):
+                        _fail("unsafe_database_tree", "Database handoff cannot follow links or special filesystem entries")
+                    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+                    if stat.S_ISDIR(s.st_mode):
+                        flags |= os.O_DIRECTORY
+                    child = os.open(name, flags, dir_fd=fd)
+                    try:
+                        current = os.fstat(child)
+                        if (current.st_dev, current.st_ino) != (s.st_dev, s.st_ino):
+                            _fail("database_handoff_identity", "A database handoff entry changed identity")
+                        validate(child, relative + (name,))
+                    finally:
+                        os.close(child)
+
+        validate(root, ())
+        known = {relative: (dev, ino, mode, directory) for relative, dev, ino, mode, directory in records}
+        # Children first; directories retain the helper owner until all descendants
+        # have been processed. Open each chain anew without following symlinks.
+        for relative, dev, ino, mode, directory in reversed(records):
+            fd = os.dup(root)
+            try:
+                for depth, name in enumerate(relative):
+                    parent_relative = relative[:depth]
+                    parent_info = os.fstat(fd)
+                    wanted = known[parent_relative]
+                    if (parent_info.st_dev, parent_info.st_ino) != wanted[:2]:
+                        _fail("database_handoff_identity", "A database handoff ancestor changed identity")
+                    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+                    if depth < len(relative) - 1 or directory:
+                        flags |= os.O_DIRECTORY
+                    child = os.open(name, flags, dir_fd=fd)
+                    os.close(fd)
+                    fd = child
+                info = os.fstat(fd)
+                if ((info.st_dev, info.st_ino) != (dev, ino) or _handoff_mount_id(fd) != mount or
+                        (info.st_uid, info.st_gid) != helper or stat.S_IMODE(info.st_mode) != mode or
+                        (not directory and (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1))):
+                    _fail("database_handoff_identity", "A database handoff entry changed after validation")
+                os.fchown(fd, *final)
+                # Ordinary DB modes survive chown. Restore only changed bits,
+                # avoiding an unnecessary CAP_FOWNER dependency after ownership
+                # has moved away from root/helper (set-id modes may need it).
+                if stat.S_IMODE(os.fstat(fd).st_mode) != mode:
+                    os.fchmod(fd, mode)
+                os.fsync(fd)
+                after = os.fstat(fd)
+                if (after.st_uid, after.st_gid) != final or stat.S_IMODE(after.st_mode) != mode:
+                    _fail("database_handoff_owner", "Database ownership handoff did not preserve the requested metadata")
+            finally:
+                os.close(fd)
+        # Reject newly-created entries after the complete preflight, not just a
+        # replaced root pathname. The server is already stopped at this point.
+        seen = set()
+        def verify(fd, relative):
+            if len(relative) > 64 or len(seen) >= 100000:
+                _fail("database_handoff_limit", "Database handoff verification exceeded its bounded traversal limit")
+            info = os.fstat(fd)
+            wanted = known.get(relative)
+            if (wanted is None or (info.st_dev, info.st_ino) != wanted[:2] or
+                    (info.st_uid, info.st_gid) != final or _handoff_mount_id(fd) != mount or
+                    stat.S_IMODE(info.st_mode) != wanted[2]):
+                _fail("database_handoff_identity", "Database output changed during ownership handoff")
+            seen.add(relative)
+            if wanted[3]:
+                if not stat.S_ISDIR(info.st_mode):
+                    _fail("unsafe_database_tree", "A database handoff directory became a non-directory")
+                names = os.listdir(fd)
+                if len(names) > 100000 - len(seen):
+                    _fail("database_handoff_limit", "Database handoff verification exceeded its bounded entry limit")
+                for name in names:
+                    child_relative = relative + (name,)
+                    record = known.get(child_relative)
+                    if record is None:
+                        _fail("database_handoff_identity", "An unrecorded database output appeared during handoff")
+                    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | (os.O_DIRECTORY if record[3] else 0)
+                    child = os.open(name, flags, dir_fd=fd)
+                    try:
+                        current = os.fstat(child)
+                        if not record[3] and (not stat.S_ISREG(current.st_mode) or current.st_nlink != 1):
+                            _fail("unsafe_database_tree", "Database output became linked or special during ownership handoff")
+                        verify(child, child_relative)
+                    finally:
+                        os.close(child)
+                os.fsync(fd)
+        verify(root, ())
+        if len(seen) != len(records):
+            _fail("database_handoff_identity", "Database output disappeared during ownership handoff")
+        fd = _handoff_open_target(target)
+        try:
+            info = os.fstat(fd)
+            if (info.st_dev, info.st_ino) != expected or _handoff_mount_id(fd) != mount:
+                _fail("database_handoff_identity", "The published database target changed identity")
+        finally:
+            os.close(fd)
+    except OSError:
+        _fail("database_handoff_failed", "Database ownership handoff failed; no successful restore was recorded")
+    finally:
+        if root is not None:
+            os.close(root)
 
 
 def _pg_literal(value):
@@ -550,8 +753,11 @@ def _restore_postgres(config, stage, target, info):
         _fail("invalid_database_metadata", "PostgreSQL login role metadata is invalid")
     if set(passwords) - set(login_roles):
         _fail("unknown_restore_role", "A password mapping references a role absent from the snapshot")
+    helper, final = _pg_restore_identities(config)
+    initial = target.lstat()
+    root_expected = (initial.st_dev, initial.st_ino)
     bootstrap = "k3s_restore_" + secrets.token_hex(12)
-    with _database_access(config, target, "postgres") as identity, _runtime_dir(identity) as runtime:
+    with _database_access(config, target, "postgres", identity=helper) as identity, _runtime_dir(identity) as runtime:
         first = entries[0]
         init = [_pg_bin(config, major, "initdb"), "-D", str(target), "--username=" + bootstrap,
                 "--encoding=" + first["encoding"], "--auth-local=trust", "--auth-host=scram-sha-256", "--no-instructions"]
@@ -573,9 +779,9 @@ def _restore_postgres(config, stage, target, info):
                     if restored.get(k) != db.get(k):
                         _fail("database_restore_mismatch", "Restored database locale or extensions differ from the snapshot")
                 actual_ext = {x["name"]: x for x in restored.get("extensions", [])}
-                for expected in db["extensions"]:
-                    actual = actual_ext.get(expected["name"], {})
-                    if any(actual.get(key) != value for key, value in expected.items()):
+                for expected_ext in db["extensions"]:
+                    actual = actual_ext.get(expected_ext["name"], {})
+                    if any(actual.get(key) != value for key, value in expected_ext.items()):
                         _fail("database_restore_mismatch", "Restored extension metadata differs from the snapshot")
                 if len(actual_ext) != len(db["extensions"]):
                     _fail("database_restore_mismatch", "Restored extension set differs from the snapshot")
@@ -588,6 +794,11 @@ def _restore_postgres(config, stage, target, info):
             _pg_query(config, major, sql, conn)
         _pg_final_config(target, identity)
         _fsync_tree(target)
+        if helper != final:
+            control = _call(config, [_pg_bin(config, major, "pg_controldata"), str(target)]).stdout
+            if not re.search(rb"(?m)^Database cluster state:\s*shut down\s*$", control):
+                _fail("database_handoff_active", "Database ownership requires verified clean shutdown control data")
+            _handoff_database_owner(target, helper, final, root_expected, clean_shutdown=True)
     if set(login_roles) - set(passwords):
         warnings.warn("restore_role_passwords_missing: some login roles have no password; configure RESTORE_ROLE_PASSWORDS_FILE before cutover", RuntimeWarning, stacklevel=2)
 

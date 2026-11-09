@@ -194,15 +194,17 @@ def files_e2e():
 
 
 @contextmanager
-def pg_server(major, data, socket_dir, *, initialize=False):
+def pg_server(major, data, socket_dir, *, initialize=False, uid=999, gid=999):
     bindir = Path("/usr/lib/postgresql") / str(major) / "bin"
     socket_dir.mkdir(mode=0o700)
-    os.chown(socket_dir, 999, 999)
+    os.chown(socket_dir, uid, gid)
+    as_owner = lambda argv: db_command("postgres", argv) if (uid, gid) == (999, 999) else ["/usr/bin/setpriv", "--reuid=" + str(uid), "--regid=" + str(gid), "--clear-groups", "--", *[str(x) for x in argv]]
     if initialize:
         print("RUN pg" + str(major) + ": initdb", flush=True)
         data.mkdir(mode=0o700)
-        os.chown(data, 999, 999)
-        command(db_command("postgres", [bindir / "initdb", "--pgdata", data, "--username=postgres",
+        require((uid, gid) == (999, 999), "fixture_init_requires_packaged_account")
+        os.chown(data, uid, gid)
+        command(as_owner([bindir / "initdb", "--pgdata", data, "--username=postgres",
                                          "--encoding=UTF8", "--locale=en_US.UTF-8", "--auth=trust"]))
     options = ("-c listen_addresses='' -c unix_socket_directories=" + str(socket_dir)
                + " -c shared_buffers=16MB -c max_connections=10 -c logging_collector=off -c max_wal_senders=3 -c jit=off")
@@ -210,13 +212,13 @@ def pg_server(major, data, socket_dir, *, initialize=False):
     started = False
     try:
         print("RUN pg" + str(major) + ": server-start", flush=True)
-        command(db_command("postgres", [bindir / "pg_ctl", "--pgdata", data, "--wait", "--timeout=60",
+        command(as_owner([bindir / "pg_ctl", "--pgdata", data, "--wait", "--timeout=60",
                                          "--log", log, "--options", options, "start"]))
         started = True
         yield bindir
     finally:
         if started:
-            command(db_command("postgres", [bindir / "pg_ctl", "--pgdata", data, "--wait", "--timeout=60",
+            command(as_owner([bindir / "pg_ctl", "--pgdata", data, "--wait", "--timeout=60",
                                              "--mode=fast", "stop"]))
             require(not (data / "postmaster.pid").exists(), "postgres_unclean_shutdown")
 
@@ -228,8 +230,8 @@ def pg_sql(bindir, socket_dir, database, sql, password):
                    env=env, data=sql.encode()).stdout.strip()
 
 
-def postgres_e2e(major, *, physical=False, old_vector=False, dual=False):
-    case = "pg" + str(major) + ("-dual" if dual else "-physical" if physical else "-vector082" if old_vector else "")
+def postgres_e2e(major, *, physical=False, old_vector=False, dual=False, final_uid=999):
+    case = "pg" + str(major) + ("-uid70" if final_uid == 70 else "-dual" if dual else "-physical" if physical else "-vector082" if old_vector else "")
     password = "synthetic-database-only"
     with case_paths(case) as (root, work, target, repo):
         os.chown(root, 999, 999)
@@ -284,15 +286,27 @@ def postgres_e2e(major, *, physical=False, old_vector=False, dual=False):
                 require(set(backup_result.get("streams", {})) == {"logical", "physical"}, "dual_stream_missing")
                 require(len(snapshots(env)) == 2, "dual_snapshot_count_mismatch")
             reject_failed_export(env)
-        recovery = dict(env, HOSTNAME="synthetic-recreated-pod")
+        recovery = dict(env, HOSTNAME="synthetic-recreated-pod", DB_UID=str(final_uid), DB_GID=str(final_uid))
+        if final_uid != 999:
+            # No passwd entry is added: initdb must run as the packaged helper,
+            # then the clean, validated tree must be handed to the target UID.
+            import pwd
+            try: pwd.getpwuid(final_uid)
+            except KeyError: pass
+            else: raise E2EFailure("target_uid_should_have_no_packaged_account")
+            os.chmod(root, 0o711)
         print("RUN " + case + ": restore-init", flush=True)
         require(cli(recovery, "restore-init").get("status") == "restored", "postgres_restore_not_completed")
         require((target / "PG_VERSION").read_text().strip() == str(major), "postgres_target_major_mismatch")
         hba = (target / "pg_hba.conf").read_text()
         require("scram-sha-256" in hba, "postgres_final_hba_not_scram")
         # The published root may be a mountpoint; its ownership must permit the real DB uid.
-        require(target.stat().st_uid == 999, "postgres_published_root_uid")
-        with pg_server(major, target, root / "socket-restored") as bindir:
+        require(target.stat().st_uid == final_uid and target.stat().st_gid == final_uid, "postgres_published_root_uid")
+        for parent, dirs, files in os.walk(target):
+            for entry in dirs + files:
+                s = (Path(parent) / entry).lstat()
+                require((s.st_uid, s.st_gid) == (final_uid, final_uid), "postgres_published_tree_uid")
+        with pg_server(major, target, root / "socket-restored", uid=final_uid, gid=final_uid) as bindir:
             for database in ("fixture_a", "fixture_b"):
                 actual = pg_sql(bindir, root / "socket-restored", database, query, password)
                 require(actual == baseline[database], "postgres_restored_invariants_mismatch")
@@ -439,7 +453,7 @@ def inside(case):
     os.chmod("/data", 0o711)
     command(["image-selftest"])
     cases = {"files": files_e2e, "pg16": lambda: postgres_e2e(16),
-             "pg17": lambda: postgres_e2e(17), "pg17-vector082": lambda: postgres_e2e(17, old_vector=True),
+             "pg17": lambda: postgres_e2e(17), "pg17-uid70": lambda: postgres_e2e(17, final_uid=70), "pg17-vector082": lambda: postgres_e2e(17, old_vector=True),
              "pg17-physical": lambda: postgres_e2e(17, physical=True), "pg17-dual": lambda: postgres_e2e(17, dual=True), "mariadb": mariadb_e2e}
     for name in cases if case == "all" else [case]:
         cases[name]()
@@ -470,7 +484,7 @@ def main(argv=None):
     parser.add_argument("--runtime", default="runc")
     parser.add_argument("--runtime-reviewed", action="store_true")
     parser.add_argument("--inside", action="store_true")
-    parser.add_argument("--case", choices=("all", "files", "pg16", "pg17", "pg17-vector082", "pg17-physical", "pg17-dual", "mariadb"), default="all")
+    parser.add_argument("--case", choices=("all", "files", "pg16", "pg17", "pg17-uid70", "pg17-vector082", "pg17-physical", "pg17-dual", "mariadb"), default="all")
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--profile", choices=("lite", "all"), help="Test only scenarios shipped by this image label")
     args = parser.parse_args(argv)

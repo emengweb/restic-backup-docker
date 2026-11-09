@@ -51,8 +51,11 @@ class EnginesTests(unittest.TestCase):
         for name, version in (("plpgsql", "1.0"), ("vector", "0.8.7")):
             (self.share / (name + ".control")).write_text("default_version = '" + version + "'\n")
         self.cfg.env["PG_SHARE_DIR_17"] = str(self.share.parent)
+        self.identity_patcher = patch.object(engines, "_pg_restore_identities", return_value=((os.geteuid(), os.getegid()), (os.geteuid(), os.getegid())))
+        self.identity_patcher.start()
 
     def tearDown(self):
+        self.identity_patcher.stop()
         self.tmp.cleanup()
 
     def error(self, code, callback):
@@ -121,8 +124,8 @@ class EnginesTests(unittest.TestCase):
             (self.stage / filename).write_bytes(b"synthetic-only\n")
 
     @contextmanager
-    def access(self, config, target, engine):
-        yield (os.geteuid(), os.getegid())
+    def access(self, config, target, engine, *, identity=None):
+        yield identity if identity is not None else (os.geteuid(), os.getegid())
 
     @contextmanager
     def server(self, *args, **kwargs):
@@ -578,6 +581,202 @@ class LegacyAndLifecycleTests(unittest.TestCase):
         kill.assert_called_once_with(self.cfg, proc, (123, 456))
         self.assertIn("--pdeathsig=TERM", popen.call_args[0][0])
         self.assertNotIn("shell", popen.call_args.kwargs)
+
+
+class PostgresOwnerHandoffTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="synthetic-owner-handoff-")
+        self.root = Path(self.tmp.name)
+        self.target = self.root / "owned-output"
+        self.target.mkdir(mode=0o700)
+        self.child = self.target / "base"
+        self.child.mkdir(mode=0o700)
+        self.file = self.child / "page"
+        self.file.write_bytes(b"synthetic-only")
+        self.file.chmod(0o600)
+        self.cfg = SimpleNamespace(env={})
+        self.helper = (os.geteuid(), os.getegid())
+        self.expected = (self.target.stat().st_dev, self.target.stat().st_ino)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def error(self, code, callback):
+        with self.assertRaises(BackupError) as caught:
+            callback()
+        self.assertEqual(code, caught.exception.code)
+
+    def transfer(self, final=(70, 70), clean=True):
+        return engines._handoff_database_owner(self.target, self.helper, final, self.expected, clean_shutdown=clean)
+
+    def identities(self, env=None, *, root=True, account=None):
+        self.cfg.env = env or {}
+        account = account or SimpleNamespace(pw_name="postgres", pw_uid=999, pw_gid=999)
+        with patch.object(engines.os, "geteuid", return_value=0 if root else 1234), patch.object(engines.os, "getegid", return_value=1234), patch.object(engines.pwd, "getpwnam", return_value=account), patch.object(engines.pwd, "getpwuid", return_value=account):
+            return engines._pg_restore_identities(self.cfg)
+
+    def test_helper_has_nss_account_final_numeric_uid_does_not_need_one(self):
+        self.assertEqual(((999, 999), (70, 70)), self.identities({"DB_UID": "70", "DB_GID": "70"}))
+        self.assertEqual(((999, 999), (999, 999)), self.identities())
+        self.assertEqual(((999, 999), (70, 71)), self.identities({"POSTGRES_UID": "70", "POSTGRES_GID": "71"}))
+        self.assertEqual(((999, 999), (72, 73)), self.identities({"DB_UID": "72", "DB_GID": "73", "POSTGRES_UID": "70", "POSTGRES_GID": "71"}))
+
+    def test_missing_helper_nss_or_root_helper_fails_closed(self):
+        with patch.object(engines.os, "geteuid", return_value=0), patch.object(engines.pwd, "getpwnam", side_effect=KeyError("synthetic")):
+            self.error("database_identity", lambda: engines._pg_restore_identities(self.cfg))
+        self.error("database_identity", lambda: self.identities(account=SimpleNamespace(pw_name="root", pw_uid=0, pw_gid=0)))
+
+    def test_final_ids_reject_zero_negative_noninteger_and_uid_sentinel(self):
+        for value in ("0", "-1", "word", "1.5", "", "4294967295", "4294967296", "9" * 100):
+            with self.subTest(value=value):
+                self.error("database_identity", lambda: self.identities({"DB_UID": value, "DB_GID": "70"}))
+        self.error("database_identity", lambda: self.identities({"DB_UID": "70", "DB_GID": "0"}))
+
+    def test_nonroot_only_current_identity_with_resolvable_nss(self):
+        self.assertEqual(((1234, 1234), (1234, 1234)), self.identities(root=False))
+        self.error("database_identity", lambda: self.identities({"DB_UID": "70", "DB_GID": "70"}, root=False))
+        with patch.object(engines.os, "geteuid", return_value=1234), patch.object(engines.pwd, "getpwuid", side_effect=KeyError("synthetic")):
+            self.error("database_identity", lambda: engines._pg_restore_identities(self.cfg))
+
+    def test_active_server_or_no_clean_shutdown_never_changes_owner(self):
+        with patch.object(engines.os, "fchown") as change:
+            self.error("database_handoff_active", lambda: self.transfer(clean=False))
+            for marker in ("postmaster.pid", "server.pid"):
+                p = self.target / marker
+                p.write_text("synthetic-active-marker")
+                with patch.object(engines.os, "geteuid", return_value=0):
+                    self.error("database_handoff_active", lambda: self.transfer())
+                p.unlink()
+            change.assert_not_called()
+
+    def test_same_final_identity_has_no_handoff_or_permission_changes(self):
+        with patch.object(engines.os, "fchown") as change, patch.object(engines, "_handoff_open_target") as opening:
+            self.transfer(self.helper)
+        change.assert_not_called()
+        opening.assert_not_called()
+
+    def test_nonroot_handoff_to_different_owner_is_rejected(self):
+        with patch.object(engines.os, "geteuid", return_value=1234):
+            self.error("database_identity", lambda: self.transfer())
+
+    def test_preflight_rejects_symlink_and_hardlink_before_any_chown(self):
+        outside = self.root / "unrelated"
+        outside.write_bytes(b"must-preserve")
+        for kind in ("symlink", "hardlink"):
+            path = self.target / kind
+            if kind == "symlink":
+                path.symlink_to(outside)
+            else:
+                os.link(outside, path)
+            with patch.object(engines.os, "geteuid", return_value=0), patch.object(engines.os, "fchown") as change:
+                self.error("unsafe_database_tree", lambda: self.transfer())
+                change.assert_not_called()
+            path.unlink()
+        self.assertEqual(b"must-preserve", outside.read_bytes())
+
+    def test_preflight_rejects_special_file_and_changed_root(self):
+        fifo = self.target / "fifo"
+        os.mkfifo(fifo)
+        with patch.object(engines.os, "geteuid", return_value=0), patch.object(engines.os, "fchown") as change:
+            self.error("unsafe_database_tree", lambda: self.transfer())
+            change.assert_not_called()
+        fifo.unlink()
+        self.expected = (self.expected[0], self.expected[1] + 1)
+        with patch.object(engines.os, "geteuid", return_value=0), patch.object(engines.os, "fchown") as change:
+            self.error("database_handoff_identity", lambda: self.transfer())
+            change.assert_not_called()
+
+    def test_preflight_rejects_mount_boundary_before_any_chown(self):
+        inode = self.file.stat().st_ino
+        native_mount = engines._handoff_mount_id
+        def changed_mount(fd):
+            return native_mount(fd) + (1 if os.fstat(fd).st_ino == inode else 0)
+        with patch.object(engines.os, "geteuid", return_value=0), patch.object(engines, "_handoff_mount_id", side_effect=changed_mount), patch.object(engines.os, "fchown") as change:
+            self.error("database_handoff_mount", lambda: self.transfer())
+            change.assert_not_called()
+
+    def test_foreign_file_owner_is_rejected_before_any_chown(self):
+        with patch.object(engines.os, "geteuid", return_value=0), patch.object(engines.os, "fchown") as change:
+            self.error("database_handoff_owner", lambda: engines._handoff_database_owner(self.target, (999, 999), (70, 70), self.expected, clean_shutdown=True))
+            change.assert_not_called()
+
+    def test_pg_logical_flow_uses_helper_and_handoffs_only_after_clean_stop(self):
+        case = EnginesTests(methodName="test_pg_restore_failure_always_stops_server")
+        case.setUp()
+        try:
+            info = pg_info()
+            case.payload(info)
+            def do_handoff(target, helper, final, expected, *, clean_shutdown):
+                self.assertEqual((999, 999), helper)
+                self.assertEqual((70, 70), final)
+                self.assertTrue(clean_shutdown)
+                self.assertEqual((target.stat().st_dev, target.stat().st_ino), expected)
+                self.assertIsInstance(expected, tuple)
+                self.assertTrue(any(a == ["server-stopped"] for a, _ in case.calls))
+                self.assertTrue(any(Path(a[0]).name == "pg_controldata" for a, _ in case.calls))
+            with patch.object(engines, "_pg_restore_identities", return_value=((999, 999), (70, 70))), patch.object(engines, "_database_access", case.access), patch.object(engines, "_pg_server", case.server), patch.object(engines, "run", case.fake_run), patch.object(engines, "_handoff_database_owner", side_effect=do_handoff) as handoff:
+                engines.restore_database(case.cfg, case.stage, case.target, {"engine": info})
+            handoff.assert_called_once()
+            init = next(a for a, _ in case.calls if any(Path(x).name == "initdb" for x in a))
+            if os.geteuid() == 0:
+                self.assertIn("--reuid=999", init)
+                self.assertNotIn("--reuid=70", init)
+        finally:
+            case.tearDown()
+
+    def test_failed_pg_logical_restore_or_unclean_control_does_not_handoff(self):
+        for failure in ("restore", "shutdown"):
+            with self.subTest(failure=failure):
+                case = EnginesTests(methodName="test_pg_restore_failure_always_stops_server")
+                case.setUp()
+                try:
+                    info = pg_info()
+                    case.payload(info)
+                    def failed(argv, **kw):
+                        if failure == "restore" and Path(argv[0]).name == "pg_restore":
+                            raise BackupError("command_failed", "Synthetic restore failure")
+                        if failure == "shutdown" and Path(argv[0]).name == "pg_controldata":
+                            return Result(0, b"Database cluster state: in production\n")
+                        return case.fake_run(argv, **kw)
+                    with patch.object(engines, "_pg_restore_identities", return_value=((999, 999), (70, 70))), patch.object(engines, "_database_access", case.access), patch.object(engines, "_pg_server", case.server), patch.object(engines, "run", failed), patch.object(engines, "_handoff_database_owner") as handoff:
+                        with self.assertRaises(BackupError):
+                            engines.restore_database(case.cfg, case.stage, case.target, {"engine": info})
+                    handoff.assert_not_called()
+                finally:
+                    case.tearDown()
+
+    def test_final_tree_handoff_is_pinned_mode_preserving_and_outside_untouched(self):
+        # Emulate fchown ownership bookkeeping so this test works as an ordinary
+        # CI runner as well as root, without requiring privileged chown/caps.
+        native_stat = os.fstat
+        native_chmod = os.fchmod
+        owners, changes = {}, []
+        before_parent = self.root.stat()
+        def fstat(fd):
+            info = native_stat(fd)
+            if info.st_ino not in owners:
+                return info
+            values = list(info)
+            values[4], values[5] = owners[info.st_ino]
+            return os.stat_result(values)
+        def fchown(fd, uid, gid):
+            info = native_stat(fd)
+            changes.append((info.st_ino, uid, gid))
+            owners[info.st_ino] = (uid, gid)
+        with patch.object(engines.os, "geteuid", return_value=0), patch.object(engines.os, "fstat", side_effect=fstat), patch.object(engines.os, "fchown", side_effect=fchown), patch.object(engines.os, "fchmod", side_effect=native_chmod):
+            self.transfer()
+        self.assertEqual({self.target.stat().st_ino, self.child.stat().st_ino, self.file.stat().st_ino}, {i for i, _, _ in changes})
+        self.assertEqual(self.target.stat().st_ino, changes[-1][0])
+        self.assertTrue(all((uid, gid) == (70, 70) for _, uid, gid in changes))
+        self.assertEqual(0o600, stat.S_IMODE(self.file.stat().st_mode))
+        self.assertEqual(0o700, stat.S_IMODE(self.target.stat().st_mode))
+        self.assertEqual((before_parent.st_uid, before_parent.st_gid, before_parent.st_mode), (self.root.stat().st_uid, self.root.stat().st_gid, self.root.stat().st_mode))
+        self.assertEqual(b"synthetic-only", self.file.read_bytes())
+
+    def test_chown_or_fsync_failure_never_reports_success(self):
+        for method in ("fchown", "fsync"):
+            with self.subTest(method=method), patch.object(engines.os, "geteuid", return_value=0), patch.object(engines.os, method, side_effect=OSError("synthetic")):
+                self.error("database_handoff_failed", lambda: self.transfer())
 
 
 if __name__ == "__main__":

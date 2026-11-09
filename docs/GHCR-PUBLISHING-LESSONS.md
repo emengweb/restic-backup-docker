@@ -93,4 +93,12 @@
 
 最终 v2.0.3 的发布校验通过，与生产灰度因为原仓库 DNS/TLS/网络超时而暂缓可以同时成立：测试使用合成仓库，不代表用户的原仓库在每个节点都可达。不要通过关闭 TLS、更换仓库地址或制造空数据库来“修复”上线。
 
+## 10. 私有 Docker 的独立目录不等于网络隔离
+
+生产接入演练曾发现原备份后端的 `docker0` 网桥缺失，现有容器 veth 无 master、直连路由丢失。容器内 RustFS 健康，宿主代理接受 TCP 却无法回源，容易被误判成 S3/Cloudflare/镜像问题。经逐端点核验，恢复原桥、网关与五个 veth 关联后，未重启容器即恢复健康和原仓库读取，实际跨节点空卷恢复随后通过。
+
+此前测试使用私有 `data-root/exec-root/containerd namespace` 和 `--bridge=none`，但仍共享宿主 network namespace。**这种隔离设计不安全。** 匹配安装版本 Debian Docker20.10.24 的[源码](<https://sources.debian.org/src/docker.io/20.10.24%2Bdfsg1-1%2Bdeb12u1/engine/daemon/daemon_unix.go/#L889>)确认：禁用默认 bridge 的初始化分支会调用 `removeDefaultBridgeInterface`，查找并删除当前网络命名空间的 `docker0`。这与现场高度吻合，是高置信可能触发机制；没有当次 LinkDel/PID 审计事件，不写成某个进程已被独立证实。
+
+**纠正：** 禁止在生产宿主 network namespace 再启动第二个 dockerd，即使目录/运行时 namespace 独立且 `iptables=false`。优先独立 VM 或托管 CI。仅 `unshare --net` 也不是完整沙箱，仍须验证 mount、进程、存储、运行时权限及凭据边界。不能通过反复重现删桥、重启生产 Docker、改业务仓库 URL 或删数据来做测试。
+
 当前完整流程、权限门槛和固定 Actions 见[发布 CI 文档](<PROFILE-CI.md>)、[当前 workflow](<../.github/workflows/docker-publish.yml>)；使用边界见[中文 README](<../README.md>)、[配置合同](<CONFIGURATION.md>)、[K3s 接入说明](<K3S-ROLLOUT.md>)。
