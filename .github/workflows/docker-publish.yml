@@ -60,24 +60,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # No execution of the source image, only a fixed-image binary copy.
-          docker pull --platform linux/amd64 restic/restic:0.19.1@sha256:136600b6ff6843d61d355f7f71f460a166429f35de6fd11b568fece3c9a4d510
-          cid="$(docker create --platform linux/amd64 restic/restic:0.19.1@sha256:136600b6ff6843d61d355f7f71f460a166429f35de6fd11b568fece3c9a4d510)"
-          trap 'docker rm "$cid" >/dev/null 2>&1 || true' EXIT
-          docker cp "$cid:/usr/bin/restic" "$RUNNER_TEMP/restic"
-          docker rm "$cid" >/dev/null
-          trap - EXIT
-          printf '%s  %s\n' 20d4142678d0d95ec11a4759def1b73fd9190abc9ca19e4b62d067c0b387e639 "$RUNNER_TEMP/restic" | sha256sum --check --strict -
-          chmod 0755 "$RUNNER_TEMP/restic"
+          python3 scripts/install-ci-tool.py restic amd64 "$RUNNER_TEMP/restic"
+          python3 scripts/install-ci-tool.py restic-legacy amd64 "$RUNNER_TEMP/restic-legacy"
           "$RUNNER_TEMP/restic" version
-          echo "RESTIC_BIN=$RUNNER_TEMP/restic" >> "$GITHUB_ENV"
-          curl --fail --show-error --location --retry 3 --proto '=https' --proto-redir '=https' \
-            https://github.com/restic/restic/releases/download/v0.16.0/restic_0.16.0_linux_amd64.bz2 \
-            --retry-all-errors --retry-max-time 180 --connect-timeout 15 --max-time 60 --output "$RUNNER_TEMP/restic-legacy.bz2"
-          printf '%s  %s\n' 492387572bb2c4de904fa400636e05492e7200b331335743d46f2f2874150162 "$RUNNER_TEMP/restic-legacy.bz2" | sha256sum --check --strict -
-          bzip2 --decompress --stdout "$RUNNER_TEMP/restic-legacy.bz2" > "$RUNNER_TEMP/restic-legacy"
-          chmod 0755 "$RUNNER_TEMP/restic-legacy"
           "$RUNNER_TEMP/restic-legacy" version
+          echo "RESTIC_BIN=$RUNNER_TEMP/restic" >> "$GITHUB_ENV"
           echo "RESTIC_LEGACY_BIN=$RUNNER_TEMP/restic-legacy" >> "$GITHUB_ENV"
       - name: Unit and real local-file restic integration (no skip allowed)
         shell: bash
@@ -171,15 +158,18 @@ jobs:
           set -euo pipefail
           python3 tests/container_e2e.py --runtime-reviewed --runtime runc \
             --docker-host unix:///var/run/docker.sock --image "$IMAGE" --profile "$PROFILE" | tee artifacts/e2e.txt
-      - name: Generate SPDX SBOM for the exact tested image
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
-        with:
-          image: ${{ env.IMAGE }}
-          format: spdx-json
-          syft-version: v1.57.0
-          output-file: artifacts/sbom.spdx.json
-          upload-artifact: false
-          upload-release-assets: false
+      - name: Generate SPDX SBOM using verified registry-sourced Syft
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/install-ci-tool.py syft "$ARCH" "$RUNNER_TEMP/syft"
+          "$RUNNER_TEMP/syft" version
+          SYFT_CHECK_FOR_APP_UPDATE=false "$RUNNER_TEMP/syft" "docker:$IMAGE" -o spdx-json=artifacts/sbom.spdx.json
+          python3 - <<'PY'
+          import json, pathlib
+          s = json.loads(pathlib.Path('artifacts/sbom.spdx.json').read_text())
+          assert s.get('spdxVersion', '').startswith('SPDX-') and s.get('packages'), 'actual image SBOM missing'
+          PY
       - name: Record tested identity and shared-base layer evidence
         shell: bash
         run: |
@@ -319,9 +309,17 @@ jobs:
           assert (loaded['Id'],loaded['Architecture'],loaded['Os']) == (d['image_id'],d['arch'],'linux')
           assert loaded['RootFS']['Layers'] == d['diff_ids'], 'loaded archive differs from tested image'
           PY
-      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # reviewed v3-bundle installer
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          cosign-release: v3.1.4
+          ref: ${{ needs.prepare.outputs.commit }}
+          persist-credentials: false
+      - name: Install verified registry-sourced Cosign
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/install-ci-tool.py cosign amd64 "$RUNNER_TEMP/cosign"
+          "$RUNNER_TEMP/cosign" version
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
@@ -441,9 +439,17 @@ jobs:
               for arch in ('amd64','arm64'): out.write(arch+'='+records[e['PROFILE'],arch]['digest']+'\n')
           print('PASS: both profiles share identical registry lite/files-base blobs within each architecture')
           PY
-      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # reviewed v3-bundle installer
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          cosign-release: v3.1.4
+          ref: ${{ needs.prepare.outputs.commit }}
+          persist-credentials: false
+      - name: Install verified registry-sourced Cosign
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/install-ci-tool.py cosign amd64 "$RUNNER_TEMP/cosign"
+          "$RUNNER_TEMP/cosign" version
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
