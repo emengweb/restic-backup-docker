@@ -1,0 +1,27 @@
+# Deny by default: even newly added private files cannot enter build context.
+**
+!Dockerfile
+!.dockerignore
+!k3s_backup/
+!k3s_backup/*.py
+!tests/
+!tests/container_e2e.py
+!scripts/
+!scripts/image-selftest.sh
+!scripts/collect-runtime.py
+
+# Never re-include metadata, credentials, local databases or archives.
+**/.git
+**/.git/**
+**/__pycache__
+**/*.pyc
+**/.env*
+**/*secret*
+**/*credential*
+**/private/**
+**/*.sql
+**/*.dump
+**/*.tar*
+**/*.bz2
+**/*.pem
+**/*.key

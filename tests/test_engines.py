@@ -1,0 +1,584 @@
+"""Synthetic tests only: no server, container, network or real secrets."""
+from contextlib import contextmanager
+import json
+import os
+from pathlib import Path
+import stat
+import tempfile
+from types import SimpleNamespace
+import unittest
+from unittest.mock import patch
+import warnings
+
+from k3s_backup import engines
+from k3s_backup.errors import BackupError
+from k3s_backup.process import Result
+
+
+def pg_db(name="alpha", archive="db-0000.dump"):
+    return {"name": name, "archive": archive, "encoding": "UTF8",
+            "lc_collate": "en_US.UTF-8", "lc_ctype": "en_US.UTF-8",
+            "locale_provider": "c", "icu_locale": None, "collation_version": "2.36",
+            "extensions": [{"name": "plpgsql", "version": "1.0"}, {"name": "vector", "version": "0.8.7"}]}
+
+
+def pg_info(names=("alpha",)):
+    return {"engine": "postgres", "source_major": "17", "target_major": "17",
+            "databases": [pg_db(n, "db-%04d.dump" % i) for i, n in enumerate(names)],
+            "globals": "globals.sql", "login_roles": ["app_owner"]}
+
+
+def maria_info(names=("alpha", "beta")):
+    return {"engine": "mariadb", "source_major": "11.8", "target_major": "11.8",
+            "databases": [{"name": n, "archive": "databases.sql", "character_set": "utf8mb4", "collation": "utf8mb4_unicode_ci"} for n in names],
+            "globals": "globals.sql", "login_accounts": [{"user": "app_owner", "host": "%"}]}
+
+
+class EnginesTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="synthetic-engines-")
+        self.root = Path(self.tmp.name)
+        self.stage = self.root / "input"
+        self.stage.mkdir(mode=0o700)
+        self.target = self.root / "output"
+        self.target.mkdir(mode=0o700)
+        self.cfg = SimpleNamespace(engine="postgres", databases=["alpha"], db_host="synthetic.invalid", db_port="5432",
+                                   db_user="app_owner", db_password="synthetic-password-only", target_major=None,
+                                   run_timeout=5, env={}, dataset_id="synthetic", work_path=self.root)
+        self.calls = []
+        self.share = self.root / "share" / "extension"
+        self.share.mkdir(parents=True)
+        for name, version in (("plpgsql", "1.0"), ("vector", "0.8.7")):
+            (self.share / (name + ".control")).write_text("default_version = '" + version + "'\n")
+        self.cfg.env["PG_SHARE_DIR_17"] = str(self.share.parent)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def error(self, code, callback):
+        with self.assertRaises(BackupError) as caught:
+            callback()
+        self.assertEqual(code, caught.exception.code)
+        self.assertNotIn(self.cfg.db_password, str(caught.exception))
+
+    def fake_run(self, argv, **kw):
+        self.assertTrue(kw.get("check"))
+        self.calls.append((list(argv), dict(kw)))
+        tool = Path(argv[0]).name
+        if kw.get("stdout_path"):
+            kw["stdout_path"].write_bytes(b"native synthetic archive\n")
+        if tool == "locale":
+            return Result(0, b"C\nC.utf8\nen_US.utf8\n")
+        if tool == "initdb":
+            dest = Path(argv[argv.index("-D") + 1])
+            for n in ("pg_hba.conf", "postgresql.conf", "PG_VERSION"):
+                (dest / n).write_text("17\n" if n == "PG_VERSION" else "# synthetic\n")
+        if tool == "pg_restore" and "--list" in argv:
+            header = b"; dbname: alpha\n; Dumped from database version: 17.11\n; Dumped by pg_dump version: 17.11\n"
+            # Native --list filters DATABASE entries unless --create is set.
+            database = b"2; 1262 16384 DATABASE - alpha app_owner\n3; 0 0 DATABASE PROPERTIES - alpha app_owner\n" if "--create" in argv else b""
+            return Result(0, header + database + b"4; 1259 1 TABLE public t app_owner\n")
+        if tool == "pg_controldata":
+            return Result(0, b"Database cluster state:               shut down\n")
+        if tool == "psql":
+            sql = kw.get("input_data", b"").decode()
+            if "server_version_num" in sql:
+                return Result(0, b"170011\n")
+            if "json_agg(rolname" in sql:
+                return Result(0, b'["app_owner"]\n')
+            if "json_build_object" in sql:
+                conn = kw["env"]["PGDATABASE"]
+                name = next(n for n in self.cfg.databases if "dbname='" + n + "'" == conn)
+                d = pg_db(name, "ignored")
+                d["external_tablespaces"] = 0
+                return Result(0, json.dumps(d).encode())
+            if "pg_is_in_recovery()" in sql:
+                return Result(0, b"f\n")
+            if "count(*) FROM pg_tablespace" in sql:
+                return Result(0, b"0\n")
+        if tool == "mariadbd":
+            return Result(0, b"mariadbd Ver 11.8.9-MariaDB for debian-linux-gnu\n")
+        if tool in {"mariadb", "mariadb-dump"}:
+            opt = next((a.split("=", 1)[1] for a in argv if a.startswith("--defaults-file=")), None)
+            if opt:
+                self.assertEqual(0o600, stat.S_IMODE(Path(opt).stat().st_mode))
+                self.assertFalse(Path(opt).is_relative_to(self.stage))
+            sql = kw.get("input_data", b"").decode()
+            if "SELECT VERSION()" in sql:
+                return Result(0, b"11.8.9-MariaDB-deb12\n")
+            if "COUNT(*)" in sql:
+                return Result(0, b"0\n")
+            if "JSON_ARRAYAGG" in sql:
+                return Result(0, json.dumps(maria_info()["login_accounts"]).encode())
+            if "JSON_OBJECT('name'" in sql:
+                n = next(n for n in self.cfg.databases if n.encode().hex() in sql)
+                d = next(d for d in maria_info(self.cfg.databases)["databases"] if d["name"] == n)
+                return Result(0, json.dumps(d).encode())
+        return Result(0)
+
+    def payload(self, info):
+        for filename in {d["archive"] for d in info["databases"]} | {info["globals"]}:
+            (self.stage / filename).write_bytes(b"synthetic-only\n")
+
+    @contextmanager
+    def access(self, config, target, engine):
+        yield (os.geteuid(), os.getegid())
+
+    @contextmanager
+    def server(self, *args, **kwargs):
+        self.calls.append((["server-start"], {}))
+        try:
+            yield self.root / "fake.sock"
+        finally:
+            self.calls.append((["server-stopped"], {}))
+
+    def test_pg_exports_every_database_and_decodes_all_blocks(self):
+        self.cfg.databases = ["alpha", "beta"]
+        with patch.object(engines, "run", self.fake_run):
+            info = engines.export_database(self.cfg, self.stage)
+        self.assertEqual(["alpha", "beta"], [d["name"] for d in info["databases"]])
+        self.assertEqual(["db-0000.dump", "db-0001.dump"], [d["archive"] for d in info["databases"]])
+        self.assertFalse((self.stage / "backup-manifest.json").exists())
+        dumps = [a for a, _ in self.calls if Path(a[0]).name == "pg_dump"]
+        self.assertEqual(2, len(dumps))
+        self.assertTrue(all("--format=custom" in a and "--create" in a for a in dumps))
+        decoded = [a for a, _ in self.calls if Path(a[0]).name == "pg_restore"]
+        self.assertEqual(2, len(decoded))
+        self.assertTrue(all("--file=/dev/null" in a and "--exit-on-error" in a for a in decoded))
+        glob = next(a for a, _ in self.calls if Path(a[0]).name == "pg_dumpall")
+        self.assertIn("--no-role-passwords", glob)
+        for a, _ in self.calls:
+            self.assertNotIn(self.cfg.db_password, " ".join(a))
+        self.assertNotIn(self.cfg.db_password, json.dumps(info))
+
+    def test_pg_nonzero_export_never_succeeds(self):
+        def broken(argv, **kw):
+            if Path(argv[0]).name == "pg_dump":
+                return Result(9, stderr=b"synthetic sensitive diagnostic")
+            return self.fake_run(argv, **kw)
+        with patch.object(engines, "run", broken):
+            self.error("database_command_failed", lambda: engines.export_database(self.cfg, self.stage))
+        self.assertFalse((self.stage / "globals.sql").exists())
+
+    def test_pg_decode_failure_is_not_a_valid_export(self):
+        def broken(argv, **kw):
+            if Path(argv[0]).name == "pg_restore":
+                raise BackupError("command_failed", "Native decode failed")
+            return self.fake_run(argv, **kw)
+        with patch.object(engines, "run", broken):
+            self.error("command_failed", lambda: engines.export_database(self.cfg, self.stage))
+
+    def test_pg_migrations_explicit_and_not_downgrades(self):
+        self.error("unsupported_postgres_version", lambda: engines._pg_major(self.cfg, "14"))
+        self.cfg.target_major = "17"
+        self.assertEqual("17", engines._pg_major(self.cfg, "14"))
+        self.cfg.target_major = "16"
+        self.error("unsupported_postgres_version", lambda: engines._pg_major(self.cfg, "17"))
+
+    def test_conninfo_database_name_is_safely_quoted(self):
+        conn = engines._pg_conn(self.cfg, "name' host=evil\\x")
+        self.assertEqual("dbname='name\\' host=evil\\\\x'", conn["PGDATABASE"])
+        self.assertEqual(self.cfg.db_password, conn["PGPASSWORD"])
+
+    def test_empty_stage_and_system_database_guards(self):
+        self.cfg.databases = ["alpha", "alpha"]
+        self.error("invalid_databases", lambda: engines.export_database(self.cfg, self.stage))
+        self.cfg.databases = ["template1"]
+        self.error("system_database", lambda: engines.export_database(self.cfg, self.stage))
+        (self.stage / "unrelated").write_text("preserve")
+        self.error("database_target_not_empty", lambda: engines.export_database(self.cfg, self.stage))
+
+    def test_archive_rejects_traversal_symlink_hardlink_empty(self):
+        self.error("invalid_database_archive", lambda: engines._archive(self.stage, "../outside"))
+        (self.root / "outside").write_bytes(b"test")
+        (self.stage / "link").symlink_to(self.root / "outside")
+        self.error("invalid_database_archive", lambda: engines._archive(self.stage, "link"))
+        (self.stage / "zero").touch()
+        self.error("invalid_database_archive", lambda: engines._archive(self.stage, "zero"))
+        os.link(self.root / "outside", self.stage / "hardlink")
+        self.error("invalid_database_archive", lambda: engines._archive(self.stage, "hardlink"))
+
+    def test_pg_restore_preserves_owners_and_only_verifier_not_plaintext(self):
+        info = pg_info()
+        self.payload(info)
+        with patch.object(engines, "run", self.fake_run), patch.object(engines, "_database_access", self.access), patch.object(engines, "_pg_server", self.server):
+            engines.restore_database(self.cfg, self.stage, self.target, {"engine": info})
+        restore = next(a for a, _ in self.calls if Path(a[0]).name == "pg_restore" and "--create" in a and "--list" not in a)
+        self.assertIn("--create", restore)
+        self.assertNotIn("--no-owner", restore)
+        self.assertNotIn("--no-privileges", restore)
+        sql = b"\n".join(k.get("input_data", b"") for _, k in self.calls)
+        self.assertIn(b"SCRAM-SHA-256$4096", sql)
+        self.assertNotIn(self.cfg.db_password.encode(), sql)
+        hba = (self.target / "pg_hba.conf").read_text()
+        self.assertFalse(any(line.strip().endswith(" trust") for line in hba.splitlines() if not line.startswith("#")))
+        self.assertIn("0.0.0.0/0 scram-sha-256", hba)
+        self.assertEqual("server-stopped", self.calls[-1][0][0])
+
+    def test_pg_restore_failure_always_stops_server(self):
+        info = pg_info()
+        self.payload(info)
+        def broken(argv, **kw):
+            if Path(argv[0]).name == "pg_restore":
+                raise BackupError("command_failed", "Restore failed safely")
+            return self.fake_run(argv, **kw)
+        with patch.object(engines, "run", broken), patch.object(engines, "_database_access", self.access), patch.object(engines, "_pg_server", self.server):
+            self.error("command_failed", lambda: engines.restore_database(self.cfg, self.stage, self.target, {"engine": info}))
+        self.assertEqual("server-stopped", self.calls[-1][0][0])
+
+    def test_locale_and_extension_fail_closed(self):
+        with patch.object(engines, "run", self.fake_run):
+            d = pg_db()
+            d["lc_collate"] = "missing.UTF-8"
+            self.error("locale_missing", lambda: engines._check_pg_requirements(self.cfg, "17", [d]))
+            d = pg_db()
+            d["extensions"][1]["version"] = "0.7.0"
+            self.error("unsupported_extension_version", lambda: engines._check_pg_requirements(self.cfg, "17", [d]))
+            d["extensions"][1]["name"] = "unknown"
+            self.error("unsupported_extension", lambda: engines._check_pg_requirements(self.cfg, "17", [d]))
+            d["locale_provider"] = "b"
+            self.error("unsupported_locale", lambda: engines._check_pg_requirements(self.cfg, "17", [d]))
+
+    def test_restore_preserves_nonempty_target_and_checks_db_set(self):
+        info = pg_info()
+        self.payload(info)
+        info["databases"][0]["name"] = "other"
+        self.error("database_set_mismatch", lambda: engines.restore_database(self.cfg, self.stage, self.target, {"engine": info}))
+        (self.target / "unrelated").write_text("do not overwrite")
+        self.error("database_target_not_empty", lambda: engines.restore_database(self.cfg, self.stage, self.target, {"engine": info}))
+        self.assertEqual("do not overwrite", (self.target / "unrelated").read_text())
+
+    def test_role_password_mapping_private_and_no_unknown_roles(self):
+        mapping = self.root / "passwords.json"
+        mapping.write_text(json.dumps({"extra": "synthetic-other"}))
+        mapping.chmod(0o644)
+        self.cfg.env["RESTORE_ROLE_PASSWORDS_FILE"] = str(mapping)
+        self.error("unsafe_role_password_file", lambda: engines._role_passwords(self.cfg))
+        mapping.chmod(0o600)
+        self.assertEqual("synthetic-other", engines._role_passwords(self.cfg)["extra"])
+        info = pg_info()
+        self.payload(info)
+        with patch.object(engines, "run", self.fake_run):
+            self.error("unknown_restore_role", lambda: engines.restore_database(self.cfg, self.stage, self.target, {"engine": info}))
+
+    def test_missing_role_password_safe_warning(self):
+        info = pg_info()
+        info["login_roles"].append("other_role_not_for_logs")
+        self.payload(info)
+        with patch.object(engines, "run", self.fake_run), patch.object(engines, "_database_access", self.access), patch.object(engines, "_pg_server", self.server), warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            engines.restore_database(self.cfg, self.stage, self.target, {"engine": info})
+        self.assertIn("restore_role_passwords_missing", str(caught[0].message))
+        self.assertNotIn("other_role_not_for_logs", str(caught[0].message))
+
+    def test_uid_override_no_passwd_entry_and_never_root(self):
+        self.cfg.env.update(DB_UID="12345", DB_GID="23456")
+        with patch.object(engines.os, "geteuid", return_value=0), patch.object(engines.pwd, "getpwnam", side_effect=AssertionError("no lookup")):
+            self.assertEqual((12345, 23456), engines._identity(self.cfg, "postgres"))
+            a = engines._as_database(self.cfg, ["/server"], (12345, 23456), parent_death=True)
+            self.assertIn("--pdeathsig=TERM", a)
+            self.assertIn("--clear-groups", a)
+        self.cfg.env.update(DB_UID="0", DB_GID="1")
+        self.error("database_identity", lambda: engines._identity(self.cfg, "postgres"))
+
+    def test_owned_stage_and_mount_modes_restored_after_failure(self):
+        volume = self.root / "volume"
+        volume.mkdir(mode=0o700)
+        parent = volume / (".k3s-restic-stage-" + "a" * 32)
+        parent.mkdir(mode=0o700)
+        payload = parent / "payload"
+        payload.mkdir()
+        with patch.object(engines, "_identity", return_value=(os.geteuid(), os.getegid())):
+            with self.assertRaisesRegex(RuntimeError, "synthetic"):
+                with engines._database_access(self.cfg, payload, "postgres"):
+                    self.assertEqual(0o710, stat.S_IMODE(parent.stat().st_mode))
+                    self.assertEqual(0o710, stat.S_IMODE(volume.stat().st_mode))
+                    raise RuntimeError("synthetic")
+        self.assertEqual(0o700, stat.S_IMODE(parent.stat().st_mode))
+        self.assertEqual(0o700, stat.S_IMODE(volume.stat().st_mode))
+
+    def test_maria_one_all_database_transaction_and_private_options(self):
+        self.cfg.engine = "mariadb"
+        self.cfg.databases = ["alpha", "beta"]
+        with patch.object(engines, "run", self.fake_run):
+            info = engines.export_database(self.cfg, self.stage)
+        dumps = [a for a, _ in self.calls if Path(a[0]).name == "mariadb-dump"]
+        self.assertEqual(2, len(dumps))
+        glob, data = dumps
+        self.assertIn("--system=users", glob)
+        self.assertIn("--replace", glob)
+        for flag in ("--single-transaction", "--routines", "--events", "--triggers", "--hex-blob", "--dump-history"):
+            self.assertIn(flag, data)
+        self.assertEqual(["alpha", "beta"], data[-2:])
+        self.assertTrue(info["globals_contains_auth_hash"])
+        for a, _ in self.calls:
+            self.assertNotIn(self.cfg.db_password, " ".join(a))
+        for a in dumps:
+            option = next(x.split("=", 1)[1] for x in a if x.startswith("--defaults-file="))
+            self.assertFalse(Path(option).exists())
+
+    def test_maria_refuses_noninnodb(self):
+        self.cfg.engine = "mariadb"
+        def noninnodb(argv, **kw):
+            if b"COUNT(*)" in kw.get("input_data", b""):
+                return Result(0, b"1\n")
+            return self.fake_run(argv, **kw)
+        with patch.object(engines, "run", noninnodb):
+            self.error("nontransactional_mariadb_tables", lambda: engines.export_database(self.cfg, self.stage))
+        self.assertFalse(any(self.stage.iterdir()))
+
+    def test_maria_no_implicit_upgrade_or_mysql_claim(self):
+        self.cfg.engine = "mariadb"
+        self.error("unsupported_mariadb_version", lambda: engines._maria_target(self.cfg, "11.5"))
+        self.error("unsupported_mariadb_version", lambda: engines._maria_version("8.4.7 MySQL Community"))
+        self.cfg.target_major = "11.8"
+        with patch.object(engines, "run", self.fake_run):
+            self.assertEqual("11.8", engines._maria_target(self.cfg, "11.5"))
+
+    def test_maria_options_escape_socket_and_cleanup(self):
+        self.cfg.db_password = 'synthetic"quote\\slash\nnewline'
+        self.cfg.db_host = "/tmp/synthetic.sock"
+        with engines._runtime_dir((os.geteuid(), os.getegid())) as runtime:
+            with engines._maria_options(self.cfg, runtime) as path:
+                data = path.read_text()
+                self.assertIn('password="synthetic\\"quote\\\\slash\\nnewline"', data)
+                self.assertIn("protocol=socket", data)
+                self.assertNotIn("protocol=tcp", data)
+            self.assertFalse(path.exists())
+        self.assertFalse(runtime.exists())
+
+    def test_maria_restore_streams_archives_and_injects_only_hash(self):
+        self.cfg.engine = "mariadb"
+        self.cfg.databases = ["alpha", "beta"]
+        info = maria_info()
+        self.payload(info)
+        with patch.object(engines, "run", self.fake_run), patch.object(engines, "_database_access", self.access), patch.object(engines, "_maria_server", self.server):
+            engines.restore_database(self.cfg, self.stage, self.target, {"engine": info})
+        streams = [k["input_path"].name for _, k in self.calls if k.get("input_path")]
+        self.assertEqual(["globals.sql", "databases.sql"], streams)
+        sql = b"\n".join(k.get("input_data", b"") for _, k in self.calls)
+        self.assertNotIn(self.cfg.db_password.encode(), sql)
+        self.assertIn(engines._maria_hash(self.cfg.db_password).encode(), sql)
+        self.assertIn(b"DROP USER", sql)
+        self.assertEqual("server-stopped", self.calls[-1][0][0])
+
+    def test_maria_restore_failure_stops_and_keeps_input(self):
+        self.cfg.engine = "mariadb"
+        self.cfg.databases = ["alpha", "beta"]
+        info = maria_info()
+        self.payload(info)
+        def broken(argv, **kw):
+            if kw.get("input_path"):
+                raise BackupError("command_failed", "Synthetic restore failed")
+            return self.fake_run(argv, **kw)
+        with patch.object(engines, "run", broken), patch.object(engines, "_database_access", self.access), patch.object(engines, "_maria_server", self.server):
+            self.error("command_failed", lambda: engines.restore_database(self.cfg, self.stage, self.target, {"engine": info}))
+        self.assertTrue((self.stage / "databases.sql").exists())
+        self.assertEqual("server-stopped", self.calls[-1][0][0])
+
+    def test_legacy_physical_risk_exact_major_clean_shutdown(self):
+        (self.target / "PG_VERSION").write_text("17\n")
+        self.error("legacy_physical_risk_required", lambda: engines.validate_physical(self.cfg, self.target, None))
+        self.cfg.env["ALLOW_LEGACY_PHYSICAL"] = "true"
+        self.cfg.target_major = "16"
+        self.error("physical_major_mismatch", lambda: engines.validate_physical(self.cfg, self.target, None))
+        self.cfg.target_major = "17"
+        with patch.object(engines, "run", self.fake_run), warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            engines.validate_physical(self.cfg, self.target, None)
+        self.assertIn("legacy_physical_consistency_unknown", str(caught[0].message))
+        with patch.object(engines, "run", return_value=Result(0, b"Database cluster state: in production\n")):
+            self.error("physical_recovery_required", lambda: engines.validate_physical(self.cfg, self.target, None))
+
+    def test_physical_maria_not_fake_implemented(self):
+        self.cfg.engine = "mariadb"
+        self.error("physical_not_implemented", lambda: engines.export_physical(self.cfg, self.stage))
+        self.error("physical_not_implemented", lambda: engines.validate_physical(self.cfg, self.target, None))
+
+    def test_native_basebackup_verifies_not_live_copy(self):
+        def physical(argv, **kw):
+            if Path(argv[0]).name == "pg_basebackup":
+                p = Path(next(a.split("=", 1)[1] for a in argv if a.startswith("--pgdata=")))
+                p.mkdir()
+                (p / "PG_VERSION").write_text("17\n")
+            return self.fake_run(argv, **kw)
+        with patch.object(engines, "run", physical):
+            info = engines.export_physical(self.cfg, self.stage)
+        self.assertEqual("pg-physical", info["kind"])
+        base = next(a for a, _ in self.calls if Path(a[0]).name == "pg_basebackup")
+        self.assertIn("--wal-method=stream", base)
+        self.assertTrue(any(Path(a[0]).name == "pg_verifybackup" for a, _ in self.calls))
+
+
+class LegacyAndLifecycleTests(unittest.TestCase):
+    setUp = EnginesTests.setUp
+    tearDown = EnginesTests.tearDown
+    fake_run = EnginesTests.fake_run
+    error = EnginesTests.error
+    access = EnginesTests.access
+    server = EnginesTests.server
+
+    def legacy_setup(self):
+        import hashlib
+        archive = self.stage / "generic.pgdump"
+        archive.write_bytes(b"PGDMPsynthetic-custom-only")
+        globals_file = self.stage / "globals-no-passwords.sql"
+        globals_file.write_text("CREATE ROLE app_owner;\nALTER ROLE app_owner WITH LOGIN;\n")
+        sums = "".join(hashlib.sha256(p.read_bytes()).hexdigest() + "  " + p.name + "\n" for p in (archive, globals_file))
+        (self.stage / "SHA256SUMS").write_text(sums)
+        metadata = self.root / "metadata.json"
+        metadata.write_text(json.dumps([pg_db()]))
+        metadata.chmod(0o600)
+        self.cfg.env["LEGACY_DATABASE_METADATA_FILE"] = str(metadata)
+        return archive, globals_file
+
+    def test_legacy_checksum_header_decode_and_metadata(self):
+        self.legacy_setup()
+        with patch.object(engines, "run", self.fake_run):
+            info = engines.legacy_manifest(self.cfg, self.stage)
+        self.assertTrue(info["legacy_native"])
+        self.assertEqual("generic.pgdump", info["databases"][0]["archive"])
+        self.assertEqual(["app_owner"], info["login_roles"])
+        self.assertIn("operator-declared", info["metadata_evidence"])
+        self.assertTrue(any("--file=/dev/null" in a for a, _ in self.calls))
+
+    def test_legacy_rejects_checksum_corruption_before_native_tools(self):
+        archive, _ = self.legacy_setup()
+        archive.write_bytes(b"PGDMPsynthetic-corrupted")
+        with patch.object(engines, "run", side_effect=AssertionError("no native execution")):
+            self.error("legacy_checksum_mismatch", lambda: engines.legacy_manifest(self.cfg, self.stage))
+
+    def test_legacy_rejects_traversal_checksum_entry(self):
+        self.legacy_setup()
+        (self.stage / "SHA256SUMS").write_text("0" * 64 + "  ../outside\n")
+        self.error("invalid_database_archive", lambda: engines.legacy_manifest(self.cfg, self.stage))
+
+    def test_legacy_does_not_guess_extension_versions_or_identity(self):
+        self.error("legacy_metadata_required", lambda: engines.legacy_manifest(self.cfg, self.stage))
+        self.legacy_setup()
+        def wrong_db(argv, **kw):
+            if "--list" in argv:
+                return Result(0, b"; dbname: unrelated\n; Dumped from database version: 17.11\n; Dumped by pg_dump version: 17.11\n")
+            return self.fake_run(argv, **kw)
+        with patch.object(engines, "run", wrong_db):
+            self.error("legacy_header_invalid", lambda: engines.legacy_manifest(self.cfg, self.stage))
+
+    def test_old_extension_install_sql_available_without_default_upgrade(self):
+        d = pg_db()
+        d["extensions"][1]["version"] = "0.8.2"
+        (self.share / "vector--0.8.2.sql").write_text("-- synthetic install only\n")
+        with patch.object(engines, "run", self.fake_run):
+            engines._check_pg_requirements(self.cfg, "17", [d])
+        self.assertEqual("0.8.2", d["extensions"][1]["version"])
+
+    def test_native_physical_recovery_validates_and_shuts_down(self):
+        (self.target / "PG_VERSION").write_text("17\n")
+        (self.target / "pg_hba.conf").write_text("local all all trust\n")
+        (self.target / "postgresql.conf").write_text("# synthetic\n")
+        info = pg_info()
+        info.update(kind="pg-physical", physical_native=True)
+        with patch.object(engines, "run", self.fake_run), patch.object(engines, "_database_access", self.access), patch.object(engines, "_pg_server", self.server):
+            engines.validate_physical(self.cfg, self.target, {"engine": info})
+        self.assertTrue(any(Path(a[0]).name == "pg_verifybackup" for a, _ in self.calls))
+        self.assertTrue(any(b"pg_is_in_recovery()" in k.get("input_data", b"") for _, k in self.calls))
+        self.assertTrue(any(a == ["server-stopped"] for a, _ in self.calls))
+
+    def test_scram_passwords_follow_postgres_saslprep(self):
+        with patch.object(engines.secrets, "token_bytes", return_value=b"x" * 16):
+            self.assertEqual(engines._scram("I\u00ADX"), engines._scram("IX"))
+            self.assertEqual(engines._scram("a\u00a0b"), engines._scram("a b"))
+            self.assertEqual(engines._scram("\u2168"), engines._scram("IX"))
+
+    def test_extension_install_version_cannot_traverse_share_directory(self):
+        d = pg_db()
+        d["extensions"][1]["version"] = "../../outside"
+        with patch.object(engines, "run", self.fake_run):
+            self.error("unsupported_extension", lambda: engines._check_pg_requirements(self.cfg, "17", [d]))
+
+    def test_maria_install_limits_redo_and_removes_passwordless_seed_users(self):
+        self.cfg.engine = "mariadb"
+        self.cfg.databases = ["alpha", "beta"]
+        info = maria_info()
+        EnginesTests.payload(self, info)
+        def with_seed(argv, **kw):
+            value = self.fake_run(argv, **kw)
+            if b"JSON_ARRAYAGG" in kw.get("input_data", b""):
+                return Result(0, json.dumps([{"user": "root", "host": "localhost"}, {"user": "", "host": "localhost"},
+                                            {"user": "mariadb.sys", "host": "localhost"}, {"user": "mysql", "host": "localhost"}]).encode())
+            return value
+        with patch.object(engines, "run", with_seed), patch.object(engines, "_database_access", self.access), patch.object(engines, "_maria_server", self.server):
+            engines.restore_database(self.cfg, self.stage, self.target, {"engine": info})
+        install = next(a for a, _ in self.calls if any(Path(x).name == "mariadb-install-db" for x in a))
+        self.assertIn("--innodb-log-file-size=8M", install)
+        sql = b"\n".join(k.get("input_data", b"") for _, k in self.calls)
+        self.assertIn(b"DROP USER IF EXISTS 'root'@'localhost'", sql)
+        self.assertIn(b"DROP USER IF EXISTS ''@'localhost'", sql)
+        self.assertNotIn(b"DROP USER IF EXISTS 'mariadb.sys'", sql)
+        self.assertNotIn(b"DROP USER IF EXISTS 'mysql'", sql)
+        import_index = next(i for i, (_, k) in enumerate(self.calls) if k.get("input_path"))
+        self.assertFalse(any(b"DROP USER" in k.get("input_data", b"") for _, k in self.calls[:import_index]))
+
+    def test_maria_bootstrap_can_restore_native_proxy_grants_and_is_removed(self):
+        self.cfg.engine = "mariadb"
+        self.cfg.databases = ["alpha", "beta"]
+        info = maria_info()
+        EnginesTests.payload(self, info)
+        with patch.object(engines, "run", self.fake_run), patch.object(engines, "_database_access", self.access), patch.object(engines, "_maria_server", self.server):
+            engines.restore_database(self.cfg, self.stage, self.target, {"engine": info})
+        create = next(k["input_data"] for _, k in self.calls if b"CREATE USER" in k.get("input_data", b""))
+        import re
+        proxy = re.search(rb"GRANT PROXY ON ''@'%' TO ('k3s_restore_[0-9a-f]+'@'localhost') WITH GRANT OPTION;", create)
+        self.assertIsNotNone(proxy)
+        account = proxy.group(1)
+        last_sql = next(k["input_data"] for _, k in reversed(self.calls) if k.get("input_data"))
+        self.assertIn(b"DROP USER " + account + b";", last_sql)
+        self.assertNotIn(self.cfg.db_password.encode(), create)
+        self.assertTrue(any(k.get("input_path") == self.stage / "globals.sql" for _, k in self.calls))
+
+    def test_native_toc_create_excludes_data_and_installs_requested_version(self):
+        with patch.object(engines, "run", self.fake_run):
+            db = pg_db()
+            db["extensions"][1]["version"] = "0.8.2"
+            engines._create_pg_database(self.cfg, "17", self.stage / "db.dump", db,
+                                        engines._pg_conn(self.cfg, "template1"), self.root)
+        sql = b"\n".join(k.get("input_data", b"") for _, k in self.calls)
+        self.assertIn(b"VERSION '0.8.2'", sql)
+        self.assertNotIn(b"VERSION '0.8.7'", sql)
+        creates = [a for a, _ in self.calls if Path(a[0]).name == "pg_restore" and "--create" in a and "--list" not in a]
+        self.assertEqual(1, len(creates))
+        toc = next(a for a, _ in self.calls if Path(a[0]).name == "pg_restore" and "--list" in a)
+        self.assertIn("--create", toc)
+        self.assertTrue(any(a.startswith("--use-list=") for a in creates[0]))
+        restores = [a for a, _ in self.calls if Path(a[0]).name == "pg_restore" and "--dbname=dbname='alpha'" in a]
+        self.assertTrue(restores)
+        self.assertNotIn("--create", restores[0])
+
+    def test_signals_drop_to_same_uid_without_cap_kill(self):
+        from unittest.mock import Mock
+        proc = Mock(pid=12345)
+        proc.poll.return_value = None
+        def signal_run(argv, **kw):
+            self.assertFalse(kw["check"])
+            self.assertIn("--reuid=123", argv)
+            self.assertIn("--regid=456", argv)
+            self.assertIn("-12345", argv)
+            self.assertNotIn(self.cfg.db_password, " ".join(argv))
+            return Result(0)
+        with patch.object(engines, "run", signal_run), patch.object(engines.os, "geteuid", return_value=0):
+            engines._signal_database(self.cfg, proc, 15, (123, 456), group=True)
+
+    def test_pg_server_failure_kills_group_and_uses_parent_death_signal(self):
+        from unittest.mock import Mock
+        proc = Mock(pid=12345)
+        proc.poll.return_value = None
+        with patch.object(engines.subprocess, "Popen", return_value=proc) as popen, patch.object(engines, "run", return_value=Result(0)), patch.object(engines, "_kill_group") as kill, patch.object(engines.Path, "exists", return_value=True):
+            with self.assertRaisesRegex(RuntimeError, "synthetic"):
+                with engines._pg_server(self.cfg, "17", self.target, self.root, (123, 456)):
+                    raise RuntimeError("synthetic")
+        kill.assert_called_once_with(self.cfg, proc, (123, 456))
+        self.assertIn("--pdeathsig=TERM", popen.call_args[0][0])
+        self.assertNotIn("shell", popen.call_args.kwargs)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.env
+.env.*
+private/
+artifacts/
+*.pgdump
+*.dump
+*.sql.gz
+*.tar
+*.tar.gz

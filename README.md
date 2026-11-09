@@ -1,3 +1,24 @@
+# K3s unified Restic backup and automatic latest recovery (local implementation)
+
+> This branch replaces the unsafe legacy startup/export scripts with a shared Python runner in one image. It is **not deployed or published**. Read [configuration](docs/CONFIGURATION.md), [image/CI](docs/IMAGE.md), and [implementation contract](docs/IMPLEMENTATION-CONTRACT.md). Legacy README below is historical, not a deployment instruction.
+
+Commands: `python3 -m k3s_backup backup|restore-init|check|prune|health|schedule`. Automatic recovery selects latest compatible snapshot without a host/Pod/node filter. `prune` plans by default; destructive cleanup is separately gated.
+
+Use the unified image as both backup sidecar and recovery init. The init must run before the main application with the target mounted at `DATA_PATH`, and separate scratch. Never use the old unfiltered `restic restore latest --target /` shell script for database logical archives. Preserve project schedules/windows and existing repo/Secret references. No need to manually specify snapshot IDs.
+
+Local tests: `RESTIC_BIN=/path/to/verified/restic python3 -m unittest discover -s tests -v`. Container E2E requires explicit reviewed-runtime opt-in and synthetic data only; see `python3 tests/container_e2e.py --help`. A skipped or not-run test is not evidence of compatibility.
+
+## Image labels (local candidates; not published)
+
+- Default / `all`: all-in-one, includes file automation, PG16/17 and MariaDB11.8 native backup/restore tools. Default Docker target `runtime` inherits `all`.
+- `lite`: database-free Restic file backup/automatic latest restore/check/prune automation; internally the shared `files` base. Not an official bare restic CLI-only image.
+- Only two image variants are built and published: default `all` and opt-in `lite`. No database/version-specific labels.
+- Both variants share the exact lite/files layer. In local amd64 tests, all≈286MB and lite≈102MB. Do not add sizes as if base layers were duplicated.
+
+GHCR stable version and SHA tags are profile-specific; the unsuffixed version is always all. Owner-enabled stable moving aliases map `latest`→all and `lite`→lite, never a prerelease or automatic default switch. See [profile CI](docs/PROFILE-CI.md). This branch has not been pushed or published.
+
+## Historical upstream README
+
 # Restic Backup Docker Container
 A docker container to automate [restic backups](https://restic.github.io/)
 

@@ -1,95 +1,510 @@
-name: Docker
-
-# This workflow uses actions that are not certified by GitHub.
-# They are provided by a third-party and are governed by
-# separate terms of service, privacy policy, and support
-# documentation.
+name: Profile backup images (tested artifacts only)
 
 on:
-  push:
-    branches: [ "master" ]
-    # Publish semver tags as releases.
-    tags: [ 'v*.*.*' ]
   pull_request:
-    branches: [ "master" ]
+  push:
+    branches: [master, main, feature/k3s-unified-backup]
+    tags: ['v*.*.*']
+  workflow_dispatch:
 
-env:
-  # Use docker.io for Docker Hub if empty
-  REGISTRY: ghcr.io
-  # github.repository as <account>/<repo>
-  IMAGE_NAME: ${{ github.repository }}
+permissions:
+  contents: read
 
+concurrency:
+  group: profile-backup-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
 
 jobs:
-  build:
+  prepare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      commit: ${{ steps.source.outputs.commit }}
+      epoch: ${{ steps.source.outputs.epoch }}
+      version: ${{ steps.source.outputs.version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Pin every profile and architecture to one source commit and timestamp
+        id: source
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          commit="$(git rev-parse HEAD)"
+          epoch="$(git show -s --format=%ct HEAD)"
+          [[ "$commit" =~ ^[0-9a-f]{40}$ && "$epoch" =~ ^[0-9]+$ ]]
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "epoch=$epoch" >> "$GITHUB_OUTPUT"
+          if [[ "$REF_TYPE" == tag ]]; then
+            [[ "$REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*)?$ ]]
+            echo "version=$REF_NAME" >> "$GITHUB_OUTPUT"
+          fi
 
-    runs-on: ubuntu-latest
+  unit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.11'
+      - name: Install checksum-verified restic (host synthetic tests only)
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --show-error --location --retry 3 --proto '=https' --proto-redir '=https' \
+            https://github.com/restic/restic/releases/download/v0.19.1/restic_0.19.1_linux_amd64.bz2 \
+            --output "$RUNNER_TEMP/restic.bz2"
+          printf '%s  %s\n' f415415624dcc452f2a02b8c33641791a8c6d6d3b65bbb3543fcf9a25151585c "$RUNNER_TEMP/restic.bz2" | sha256sum --check --strict -
+          bzip2 --decompress --stdout "$RUNNER_TEMP/restic.bz2" > "$RUNNER_TEMP/restic"
+          chmod 0755 "$RUNNER_TEMP/restic"
+          "$RUNNER_TEMP/restic" version
+          echo "RESTIC_BIN=$RUNNER_TEMP/restic" >> "$GITHUB_ENV"
+          curl --fail --show-error --location --retry 3 --proto '=https' --proto-redir '=https' \
+            https://github.com/restic/restic/releases/download/v0.16.0/restic_0.16.0_linux_amd64.bz2 \
+            --output "$RUNNER_TEMP/restic-legacy.bz2"
+          printf '%s  %s\n' 492387572bb2c4de904fa400636e05492e7200b331335743d46f2f2874150162 "$RUNNER_TEMP/restic-legacy.bz2" | sha256sum --check --strict -
+          bzip2 --decompress --stdout "$RUNNER_TEMP/restic-legacy.bz2" > "$RUNNER_TEMP/restic-legacy"
+          chmod 0755 "$RUNNER_TEMP/restic-legacy"
+          "$RUNNER_TEMP/restic-legacy" version
+          echo "RESTIC_LEGACY_BIN=$RUNNER_TEMP/restic-legacy" >> "$GITHUB_ENV"
+      - name: Unit and real local-file restic integration (no skip allowed)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/backup-unit-home"
+          # These synthetic ownership tests must execute, not skip on the hosted runner.
+          # Forward only test-tool paths; no GitHub, cloud or production credentials.
+          sudo --non-interactive env --ignore-environment \
+            PATH="$PATH" HOME="$RUNNER_TEMP/backup-unit-home" LANG=C.UTF-8 \
+            RESTIC_BIN="$RESTIC_BIN" RESTIC_LEGACY_BIN="$RESTIC_LEGACY_BIN" \
+            "$(command -v python3)" - <<'PY'
+          import os, pathlib, unittest
+          assert os.geteuid() == 0, 'required ownership tests need synthetic-only root'
+          assert pathlib.Path(os.environ['RESTIC_BIN']).is_file()
+          suite = unittest.defaultTestLoader.discover('tests')
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          assert result.testsRun > 0, 'NOT RUN: no tests discovered'
+          assert not result.skipped, 'NOT RUN: skipped tests are forbidden in required CI'
+          raise SystemExit(0 if result.wasSuccessful() else 1)
+          PY
+          python3 tests/container_e2e.py --self-test
+          sh -n scripts/image-selftest.sh
+
+  image-test:
+    needs: [prepare, unit]
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - {arch: amd64, runner: ubuntu-24.04}
+          - {arch: arm64, runner: ubuntu-24.04-arm}
+        profile:
+          - {name: all, target: all}
+          - {name: lite, target: lite}
+    runs-on: ${{ matrix.platform.runner }}
+    timeout-minutes: 90
+    env:
+      IMAGE: backup-ci:${{ needs.prepare.outputs.commit }}-${{ matrix.profile.name }}-${{ matrix.platform.arch }}
+      PROFILE: ${{ matrix.profile.name }}
+      TARGET: ${{ matrix.profile.target }}
+      ARCH: ${{ matrix.platform.arch }}
+      SOURCE_COMMIT: ${{ needs.prepare.outputs.commit }}
+      SOURCE_DATE_EPOCH: ${{ needs.prepare.outputs.epoch }}
+      BUILDX_METADATA_PROVENANCE: max
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.prepare.outputs.commit }}
+          persist-credentials: false
+      - name: Record native runner and fail closed on old or unknown runc
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker version
+          docker info --format '{{json .Runtimes}}'
+          python3 - <<'PY'
+          import json, os, platform, re, subprocess
+          expected = {'amd64': 'x86_64', 'arm64': 'aarch64'}[os.environ['ARCH']]
+          assert platform.machine() == expected, 'NOT RUN: native architecture is required; no emulation fallback'
+          d = json.loads(subprocess.check_output(['docker','version','--format','{{json .Server.Components}}']))
+          versions = [x['Version'] for x in d if x['Name'] == 'runc']
+          assert len(versions) == 1, 'NOT RUN: daemon runc version cannot be established'
+          m = re.fullmatch(r'(?:v)?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?', versions[0])
+          assert m and tuple(map(int,m.groups())) >= (1,4,2), 'NOT RUN: runtime below reviewed runc 1.4.2 floor'
+          PY
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        with:
+          version: v0.38.2
+          driver: docker-container
+          driver-opts: image=moby/buildkit@sha256:c5f8862f52499773af85bc07695b2379ef08e8002352b0df2c4864c91d78dabe
+      - name: Build only this profile on its native architecture, never push
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          target: ${{ matrix.profile.target }}
+          platforms: linux/${{ matrix.platform.arch }}
+          push: false
+          tags: ${{ env.IMAGE }}
+          build-args: |
+            SOURCE_DATE_EPOCH=${{ needs.prepare.outputs.epoch }}
+          # The docker exporter without dest loads into the local daemon. Rewrite
+          # layer tar timestamps too, not only image.created, across separate jobs.
+          outputs: type=docker,rewrite-timestamp=true
+          # Docker load cannot retain OCI attestations. Keep real max build metadata
+          # and attest that predicate after pushing the tested image, without rebuild.
+          provenance: false
+      - name: Preserve actual build provenance
+        env:
+          BUILD_METADATA: ${{ steps.build.outputs.metadata }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir artifacts
+          python3 - <<'PY'
+          import json, os, pathlib
+          d = json.loads(os.environ['BUILD_METADATA'])
+          p = d.get('buildx.build.provenance')
+          assert isinstance(p, dict), 'build provenance missing'
+          predicate = p.get('predicate', p)
+          assert predicate.get('buildType'), 'build provenance predicate missing'
+          pathlib.Path('artifacts/build-metadata.json').write_text(json.dumps(d))
+          pathlib.Path('artifacts/provenance.json').write_text(json.dumps(predicate))
+          PY
+      - name: Real synthetic E2E for this profile only, never claim all-engine success
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tests/container_e2e.py --runtime-reviewed --runtime runc \
+            --docker-host unix:///var/run/docker.sock --image "$IMAGE" --profile "$PROFILE" | tee artifacts/e2e.txt
+      - name: Generate SPDX SBOM for the exact tested image
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          image: ${{ env.IMAGE }}
+          format: spdx-json
+          syft-version: v1.57.0
+          output-file: artifacts/sbom.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+      - name: Record tested identity and shared-base layer evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import datetime, json, os, pathlib, re, subprocess
+          d, = json.loads(subprocess.check_output(['docker','image','inspect',os.environ['IMAGE']]))
+          assert d['Architecture'] == os.environ['ARCH'] and d['Os'] == 'linux', 'image architecture mismatch'
+          assert re.fullmatch(r'sha256:[0-9a-f]{64}', d['Id'])
+          layers = d['RootFS']['Layers']
+          assert layers and all(re.fullmatch(r'sha256:[0-9a-f]{64}', x) for x in layers)
+          created = datetime.datetime.fromisoformat(d['Created'].replace('Z','+00:00'))
+          assert int(created.timestamp()) == int(os.environ['SOURCE_DATE_EPOCH']), 'build did not honor SOURCE_DATE_EPOCH'
+          identity = dict(schema_version=1, commit=os.environ['SOURCE_COMMIT'], epoch=int(os.environ['SOURCE_DATE_EPOCH']),
+                          profile=os.environ['PROFILE'], target=os.environ['TARGET'], arch=os.environ['ARCH'],
+                          image_id=d['Id'], diff_ids=layers)
+          pathlib.Path('artifacts/identity.json').write_text(json.dumps(identity, sort_keys=True))
+          PY
+      - name: Save the exact tested image for release, never rebuild it later
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker save "$IMAGE" | gzip -1 > artifacts/image.tar.gz
+      - name: Hash the same-run evidence and optional release archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd artifacts && sha256sum identity.json e2e.txt sbom.spdx.json provenance.json build-metadata.json > SHA256SUMS)
+          if [[ -f artifacts/image.tar.gz ]]; then
+            (cd artifacts && sha256sum image.tar.gz >> SHA256SUMS)
+          fi
+      - name: Retain profile-and-architecture-specific tested artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: tested-${{ matrix.profile.name }}-${{ matrix.platform.arch }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
+
+  shared-base:
+    needs: [prepare, image-test]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: tested-*-${{ matrix.arch }}
+          path: tested
+      - name: Require identical lite/files-base diff-ID prefix in every profile of this architecture
+        env:
+          ARCH: ${{ matrix.arch }}
+          SOURCE_COMMIT: ${{ needs.prepare.outputs.commit }}
+          SOURCE_DATE_EPOCH: ${{ needs.prepare.outputs.epoch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, pathlib, re
+          profiles = {'all':'all','lite':'lite'}
+          root = pathlib.Path('tested'); arch = os.environ['ARCH']; records = {}
+          assert {p.name for p in root.iterdir()} == {f'tested-{p}-{arch}' for p in profiles}, 'incomplete profile evidence'
+          for profile, target in profiles.items():
+              d = json.loads((root / f'tested-{profile}-{arch}' / 'identity.json').read_text())
+              assert d['schema_version'] == 1 and d['commit'] == os.environ['SOURCE_COMMIT']
+              assert d['epoch'] == int(os.environ['SOURCE_DATE_EPOCH'])
+              assert (d['profile'], d['target'], d['arch']) == (profile, target, arch)
+              assert re.fullmatch(r'sha256:[0-9a-f]{64}', d['image_id'])
+              assert d['diff_ids'] and all(re.fullmatch(r'sha256:[0-9a-f]{64}', x) for x in d['diff_ids'])
+              records[profile] = d
+          base = records['lite']['diff_ids']
+          for profile, d in records.items():
+              assert d['diff_ids'][:len(base)] == base, f'{profile}/{arch}: files base is not an identical layer prefix'
+          print(f'PASS: {len(base)} identical lite/files-base layers shared by both {arch} profiles')
+          PY
+
+  publish-architecture:
+    needs: [prepare, unit, image-test, shared-base]
+    # Default off. Only a trusted version-tag push may enter the protected environment.
+    if: github.event_name == 'push' && github.ref_type == 'tag' && needs.prepare.outputs.version != '' && vars.ENABLE_GHCR_PUBLISH == 'true'
+    environment: ghcr-release
     permissions:
       contents: read
       packages: write
-      # This is used to complete the identity challenge
-      # with sigstore/fulcio when running outside of PRs.
       id-token: write
-
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+        profile: [all, lite]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v3
-
-      # Install the cosign tool except on PR
-      # https://github.com/sigstore/cosign-installer
-      - name: Install cosign
-        if: github.event_name != 'pull_request'
-        uses: sigstore/cosign-installer@6e04d228eb30da1757ee4e1dd75a0ec73a653e06 #v3.1.1
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          cosign-release: 'v2.1.1'
-
-      # Workaround: https://github.com/docker/build-push-action/issues/461
-      - name: Setup Docker buildx
-        uses: docker/setup-buildx-action@79abd3f86f79a9d68a23c75a09a9a85889262adf
-
-      # Login against a Docker registry except on PR
-      # https://github.com/docker/login-action
-      - name: Log into registry ${{ env.REGISTRY }}
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@28218f9b04b4f3f62068d7b6ce6ca5b26e35336c
+          name: tested-${{ matrix.profile }}-${{ matrix.arch }}
+          path: artifacts
+      - name: Validate exact tested archive, commit, profile and native architecture
+        id: release
+        env:
+          REPOSITORY: ${{ github.repository }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          SOURCE_COMMIT: ${{ needs.prepare.outputs.commit }}
+          SOURCE_DATE_EPOCH: ${{ needs.prepare.outputs.epoch }}
+          PROFILE: ${{ matrix.profile }}
+          ARCH: ${{ matrix.arch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd artifacts && sha256sum --check --strict SHA256SUMS)
+          python3 - <<'PY'
+          import json, os, pathlib, re
+          e = os.environ; d = json.loads(pathlib.Path('artifacts/identity.json').read_text())
+          targets = {'all':'all','lite':'lite'}
+          assert re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*)?', e['VERSION'])
+          assert re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', e['REPOSITORY'])
+          assert d['schema_version'] == 1 and d['commit'] == e['SOURCE_COMMIT'] and re.fullmatch(r'[0-9a-f]{40}', d['commit'])
+          assert d['epoch'] == int(e['SOURCE_DATE_EPOCH'])
+          assert (d['profile'],d['target'],d['arch']) == (e['PROFILE'],targets[e['PROFILE']],e['ARCH'])
+          assert re.fullmatch(r'sha256:[0-9a-f]{64}', d['image_id'])
+          assert pathlib.Path('artifacts/image.tar.gz').is_file()
+          with open(e['GITHUB_OUTPUT'], 'a') as out:
+              out.write('image=ghcr.io/' + e['REPOSITORY'].lower() + '\n')
+              out.write('version_tag=' + '-'.join((e['VERSION'],e['PROFILE'],e['ARCH'])) + '\n')
+              out.write('sha_tag=' + '-'.join(('sha',d['commit'],e['PROFILE'],e['ARCH'])) + '\n')
+              out.write('image_id=' + d['image_id'] + '\n')
+          PY
+          gzip --decompress --stdout artifacts/image.tar.gz | docker load
+          python3 - <<'PY'
+          import json, pathlib, subprocess
+          d = json.loads(pathlib.Path('artifacts/identity.json').read_text())
+          loaded, = json.loads(subprocess.check_output(['docker','image','inspect',d['image_id']]))
+          assert (loaded['Id'],loaded['Architecture'],loaded['Os']) == (d['image_id'],d['arch'],'linux')
+          assert loaded['RootFS']['Layers'] == d['diff_ids'], 'loaded archive differs from tested image'
+          PY
+      - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
         with:
-          registry: ${{ env.REGISTRY }}
+          cosign-release: v3.1.4
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      # Extract metadata (tags, labels) for Docker
-      # https://github.com/docker/metadata-action
-      - name: Extract Docker metadata
-        id: meta
-        uses: docker/metadata-action@98669ae865ea3cffbcbaa878cf57c20bbf1c6c38
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-
-      # Build and push Docker image with Buildx (don't push on PR)
-      # https://github.com/docker/build-push-action
-      - name: Build and push Docker image
-        id: build-and-push
-        uses: docker/build-push-action@ac9327eae2b366085ac7f6a2d02df8aa8ead720a
-        with:
-          context: .
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-
-      # Sign the resulting Docker image digest except on PRs.
-      # This will only write to the public Rekor transparency log when the Docker
-      # repository is public to avoid leaking data.  If you would like to publish
-      # transparency data even for private images, pass --force to cosign below.
-      # https://github.com/sigstore/cosign
-      - name: Sign the published Docker image
-        if: ${{ github.event_name != 'pull_request' }}
+      - name: Push only tested image ID and sign exact digest, SBOM and provenance
         env:
-          # https://docs.github.com/en/actions/security-guides/security-hardening-for-github-actions#using-an-intermediate-environment-variable
-          TAGS: ${{ steps.meta.outputs.tags }}
-          DIGEST: ${{ steps.build-and-push.outputs.digest }}
-        # This step uses the identity token to provision an ephemeral certificate
-        # against the sigstore community Fulcio instance.
-        run: echo "${TAGS}" | xargs -I {} cosign sign --yes {}@${DIGEST}
+          IMAGE: ${{ steps.release.outputs.image }}
+          IMAGE_ID: ${{ steps.release.outputs.image_id }}
+          VERSION_TAG: ${{ steps.release.outputs.version_tag }}
+          SHA_TAG: ${{ steps.release.outputs.sha_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker tag "$IMAGE_ID" "$IMAGE:$VERSION_TAG"
+          docker tag "$IMAGE_ID" "$IMAGE:$SHA_TAG"
+          docker push "$IMAGE:$VERSION_TAG"
+          docker push "$IMAGE:$SHA_TAG"
+          python3 - <<'PY'
+          import json, os, pathlib, re, subprocess
+          e = os.environ; identity = json.loads(pathlib.Path('artifacts/identity.json').read_text())
+          d, = json.loads(subprocess.check_output(['docker','image','inspect',e['IMAGE_ID']]))
+          digests = {x.split('@',1)[1] for x in d.get('RepoDigests',[]) if x.startswith(e['IMAGE']+'@')}
+          assert len(digests) == 1, 'ambiguous pushed image digest'
+          digest, = digests
+          assert re.fullmatch(r'sha256:[0-9a-f]{64}',digest)
+          manifest = json.loads(subprocess.check_output(['docker','manifest','inspect',e['IMAGE']+'@'+digest]))
+          assert manifest['schemaVersion'] == 2 and manifest['config']['digest'] == identity['image_id']
+          layers = [x['digest'] for x in manifest['layers']]
+          assert len(layers) == len(identity['diff_ids']) and all(re.fullmatch(r'sha256:[0-9a-f]{64}',x) for x in layers)
+          receipt = dict(identity, image=e['IMAGE'], digest=digest, layers=layers)
+          pathlib.Path('digests').mkdir()
+          pathlib.Path('digests/receipt.json').write_text(json.dumps(receipt,sort_keys=True))
+          with open(e['GITHUB_ENV'],'a') as out: out.write('PUBLISHED_DIGEST='+digest+'\n')
+          PY
+          # GITHUB_ENV becomes visible only in the next step.
+      - name: Sign the pushed architecture digest and attest its tested evidence
+        env:
+          IMAGE: ${{ steps.release.outputs.image }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cosign sign --yes "$IMAGE@$PUBLISHED_DIGEST"
+          cosign attest --yes --type spdxjson --predicate artifacts/sbom.spdx.json "$IMAGE@$PUBLISHED_DIGEST"
+          cosign attest --yes --type slsaprovenance --predicate artifacts/provenance.json "$IMAGE@$PUBLISHED_DIGEST"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: published-digest-${{ matrix.profile }}-${{ matrix.arch }}
+          path: digests/
+          if-no-files-found: error
+          retention-days: 3
+
+  publish-index:
+    needs: [prepare, publish-architecture]
+    concurrency:
+      group: profile-release-index-${{ github.repository }}-${{ matrix.profile }}
+      cancel-in-progress: false
+    if: github.event_name == 'push' && github.ref_type == 'tag' && needs.prepare.outputs.version != '' && vars.ENABLE_GHCR_PUBLISH == 'true'
+    environment: ghcr-release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [all, lite]
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: published-digest-*
+          path: published
+      - name: Verify registry blob sharing and select only this profile's two tested digests
+        id: release
+        env:
+          UPDATE_MOVING_ALIASES: ${{ vars.UPDATE_MOVING_ALIASES }}
+          REPOSITORY: ${{ github.repository }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          SOURCE_COMMIT: ${{ needs.prepare.outputs.commit }}
+          SOURCE_DATE_EPOCH: ${{ needs.prepare.outputs.epoch }}
+          PROFILE: ${{ matrix.profile }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, pathlib, re
+          e = os.environ; root = pathlib.Path('published'); records = {}
+          targets = {'all':'all','lite':'lite'}
+          image = 'ghcr.io/'+e['REPOSITORY'].lower()
+          assert re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*)?',e['VERSION'])
+          expected = {f'published-digest-{p}-{a}' for p in targets for a in ('amd64','arm64')}
+          assert {p.name for p in root.iterdir()} == expected, 'all four signed architecture receipts are required'
+          for profile, target in targets.items():
+              for arch in ('amd64','arm64'):
+                  d = json.loads((root/f'published-digest-{profile}-{arch}'/'receipt.json').read_text())
+                  assert d['schema_version'] == 1 and d['commit'] == e['SOURCE_COMMIT'] and d['epoch'] == int(e['SOURCE_DATE_EPOCH'])
+                  assert (d['profile'],d['target'],d['arch'],d['image']) == (profile,target,arch,image)
+                  assert re.fullmatch(r'sha256:[0-9a-f]{64}',d['digest']) and re.fullmatch(r'sha256:[0-9a-f]{64}',d['image_id'])
+                  assert d['layers'] and all(re.fullmatch(r'sha256:[0-9a-f]{64}',x) for x in d['layers'])
+                  records[profile,arch] = d
+          for arch in ('amd64','arm64'):
+              base = records['lite',arch]['layers']
+              for profile in targets:
+                  assert records[profile,arch]['layers'][:len(base)] == base, f'{profile}/{arch}: compressed registry base blobs are not identical'
+          with open(e['GITHUB_OUTPUT'],'a') as out:
+              out.write('image='+image+'\n')
+              out.write('version_tag='+e['VERSION']+'-'+e['PROFILE']+'\n')
+              out.write('sha_tag=sha-'+e['SOURCE_COMMIT']+'-'+e['PROFILE']+'\n')
+              if e['PROFILE'] == 'all':
+                  out.write('default_version_tag='+e['VERSION']+'\n')
+                  out.write('default_sha_tag=sha-'+e['SOURCE_COMMIT']+'\n')
+              if e.get('UPDATE_MOVING_ALIASES') == 'true' and re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+',e['VERSION']):
+                  if e['PROFILE'] == 'all': out.write('channel_tag=latest\n')
+                  elif e['PROFILE'] == 'lite': out.write('channel_tag=lite\n')
+              for arch in ('amd64','arm64'): out.write(arch+'='+records[e['PROFILE'],arch]['digest']+'\n')
+          print('PASS: both profiles share identical registry lite/files-base blobs within each architecture')
+          PY
+      - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+        with:
+          cosign-release: v3.1.4
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish signed same-profile indexes with optional stable all/lite channels
+        env:
+          IMAGE: ${{ steps.release.outputs.image }}
+          VERSION_TAG: ${{ steps.release.outputs.version_tag }}
+          SHA_TAG: ${{ steps.release.outputs.sha_tag }}
+          AMD64_DIGEST: ${{ steps.release.outputs.amd64 }}
+          ARM64_DIGEST: ${{ steps.release.outputs.arm64 }}
+          DEFAULT_VERSION_TAG: ${{ steps.release.outputs.default_version_tag }}
+          DEFAULT_SHA_TAG: ${{ steps.release.outputs.default_sha_tag }}
+          CHANNEL_TAG: ${{ steps.release.outputs.channel_tag }}
+          PROFILE: ${{ matrix.profile }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          UPDATE_MOVING_ALIASES: ${{ vars.UPDATE_MOVING_ALIASES }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker manifest create "$IMAGE:$VERSION_TAG" "$IMAGE@$AMD64_DIGEST" "$IMAGE@$ARM64_DIGEST"
+          digest="$(docker manifest push "$IMAGE:$VERSION_TAG")"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          docker manifest create "$IMAGE:$SHA_TAG" "$IMAGE@$AMD64_DIGEST" "$IMAGE@$ARM64_DIGEST"
+          sha_digest="$(docker manifest push "$IMAGE:$SHA_TAG")"
+          test "$digest" = "$sha_digest"
+          # Only all-in-one owns the unsuffixed/default version and source tags.
+          if [[ -n "$DEFAULT_VERSION_TAG" ]]; then
+            [[ "$VERSION_TAG" == "$DEFAULT_VERSION_TAG-all" && "$SHA_TAG" == "$DEFAULT_SHA_TAG-all" ]]
+            for alias in "$DEFAULT_VERSION_TAG" "$DEFAULT_SHA_TAG"; do
+              docker manifest create "$IMAGE:$alias" "$IMAGE@$AMD64_DIGEST" "$IMAGE@$ARM64_DIGEST"
+              alias_digest="$(docker manifest push "$IMAGE:$alias")"
+              test "$digest" = "$alias_digest"
+              printf '%s\n' "- $IMAGE:$alias (default all-in-one)" >> "$GITHUB_STEP_SUMMARY"
+            done
+          fi
+          cosign sign --yes "$IMAGE@$digest"
+          # Extra owner gate; prereleases can never replace moving aliases.
+          if [[ -n "$CHANNEL_TAG" ]]; then
+            [[ "$UPDATE_MOVING_ALIASES" == true && "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+            [[ ( "$PROFILE" == all && "$CHANNEL_TAG" == latest ) || ( "$PROFILE" == lite && "$CHANNEL_TAG" == lite ) ]]
+            docker manifest create "$IMAGE:$CHANNEL_TAG" "$IMAGE@$AMD64_DIGEST" "$IMAGE@$ARM64_DIGEST"
+            channel_digest="$(docker manifest push "$IMAGE:$CHANNEL_TAG")"
+            test "$digest" = "$channel_digest"
+            printf '%s\n' "- $IMAGE:$CHANNEL_TAG (stable $PROFILE channel)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          printf 'Released tested profile index: %s:%s -> %s@%s\n' "$IMAGE" "$VERSION_TAG" "$IMAGE" "$digest"
+          printf '%s\n' "- $IMAGE:$VERSION_TAG" "- $IMAGE:$SHA_TAG" "- $IMAGE@$digest" >> "$GITHUB_STEP_SUMMARY"
