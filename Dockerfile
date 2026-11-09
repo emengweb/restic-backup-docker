@@ -1,5 +1,8 @@
 # One final multiarch image contains every supported database engine.
 # Supply-chain evidence and limitations: docs/IMAGE.md (no floating inputs).
+# Official Restic image: only its verified static binary enters our runtime.
+FROM restic/restic:0.19.1@sha256:136600b6ff6843d61d355f7f71f460a166429f35de6fd11b568fece3c9a4d510 AS restic-source
+
 FROM debian:bookworm-20261104-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc AS build
 ARG TARGETARCH
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -96,17 +99,15 @@ RUN set -eu; cd /tmp/image-downloads; \
     install -d -o postgres -g postgres -m 0700 /var/lib/postgresql; \
     install -d -o mysql -g mysql -m 0700 /var/lib/mysql
 
+COPY --from=restic-source /usr/bin/restic /usr/local/bin/restic
 RUN set -eu; \
     case "$TARGETARCH" in \
-      amd64) checksum=f415415624dcc452f2a02b8c33641791a8c6d6d3b65bbb3543fcf9a25151585c ;; \
-      arm64) checksum=a5f64aaab53d51e311fa3829124c5b703f2d14cf187d8640b6be3b2b49376465 ;; \
+      amd64) checksum=20d4142678d0d95ec11a4759def1b73fd9190abc9ca19e4b62d067c0b387e639 ;; \
+      arm64) checksum=2fb45ac6f9071b6f20eb883953a188f9e7c7cb6bbe43c67a2e47ada4e85ee7f0 ;; \
       *) exit 1 ;; \
     esac; \
-    curl --fail --show-error --location --retry 3 --proto '=https' --proto-redir '=https' \
-      "https://github.com/restic/restic/releases/download/v0.19.1/restic_0.19.1_linux_${TARGETARCH}.bz2" --output /tmp/restic.bz2; \
-    printf '%s  /tmp/restic.bz2\n' "$checksum" | sha256sum --check --strict -; \
-    bzip2 --decompress --stdout /tmp/restic.bz2 > /usr/local/bin/restic; \
-    chmod 0755 /usr/local/bin/restic; rm /tmp/restic.bz2
+    printf '%s  /usr/local/bin/restic\n' "$checksum" | sha256sum --check --strict -; \
+    chmod 0755 /usr/local/bin/restic; restic version
 
 # Preserve the deployed vector0.8.2 SQL identity with pgvector0.8.7 update chain.
 # Native library compatibility must still pass the synthetic old-version case.
