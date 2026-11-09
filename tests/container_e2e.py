@@ -305,6 +305,11 @@ def postgres_e2e(major, *, physical=False, old_vector=False, dual=False, final_u
         for parent, dirs, files in os.walk(target):
             for entry in dirs + files:
                 s = (Path(parent) / entry).lstat()
+                if parent == str(target) and entry == ".k3s-restic-restore.json":
+                    # The publication journal is deliberately owned by the root runner,
+                    # not the database process. It is not native PostgreSQL payload.
+                    require(s.st_uid == 0 and stat.S_IMODE(s.st_mode) == 0o600, "postgres_restore_journal_owner")
+                    continue
                 require((s.st_uid, s.st_gid) == (final_uid, final_uid), "postgres_published_tree_uid")
         with pg_server(major, target, root / "socket-restored", uid=final_uid, gid=final_uid) as bindir:
             for database in ("fixture_a", "fixture_b"):
