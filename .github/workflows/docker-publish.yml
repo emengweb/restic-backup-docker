@@ -147,39 +147,21 @@ jobs:
           driver: docker-container
           driver-opts: image=moby/buildkit@sha256:c5f8862f52499773af85bc07695b2379ef08e8002352b0df2c4864c91d78dabe
       - name: Build only this profile on its native architecture, never push
-        id: build
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
-        with:
-          context: .
-          target: ${{ matrix.profile.target }}
-          platforms: linux/${{ matrix.platform.arch }}
-          push: false
-          tags: ${{ env.IMAGE }}
-          build-args: |
-            SOURCE_DATE_EPOCH=${{ needs.prepare.outputs.epoch }}
-          # The docker exporter without dest loads into the local daemon. Rewrite
-          # layer tar timestamps too, not only image.created, across separate jobs.
-          outputs: type=docker,rewrite-timestamp=true
-          # Docker load cannot retain OCI attestations. Keep real max build metadata
-          # and attest that predicate after pushing the tested image, without rebuild.
-          provenance: false
-      - name: Preserve actual build provenance
-        env:
-          BUILD_METADATA: ${{ steps.build.outputs.metadata }}
         shell: bash
         run: |
           set -euo pipefail
-          mkdir artifacts
-          python3 - <<'PY'
-          import json, os, pathlib
-          d = json.loads(os.environ['BUILD_METADATA'])
-          p = d.get('buildx.build.provenance')
-          assert isinstance(p, dict), 'build provenance missing'
-          predicate = p.get('predicate', p)
-          assert predicate.get('buildType'), 'build provenance predicate missing'
-          pathlib.Path('artifacts/build-metadata.json').write_text(json.dumps(d))
-          pathlib.Path('artifacts/provenance.json').write_text(json.dumps(predicate))
-          PY
+          # Metadata can be many MiB; never expand it into an environment value.
+          # Docker exporter loads the tested image locally, with no registry push.
+          docker buildx build \
+            --file Dockerfile --target "$TARGET" --platform "linux/$ARCH" \
+            --tag "$IMAGE" --build-arg "SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH" \
+            --output type=docker,rewrite-timestamp=true --provenance=false \
+            --metadata-file "$RUNNER_TEMP/build-metadata.json" .
+      - name: Preserve actual build provenance from the metadata file
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/extract-build-provenance.py "$RUNNER_TEMP/build-metadata.json" artifacts
       - name: Real synthetic E2E for this profile only, never claim all-engine success
         shell: bash
         run: |

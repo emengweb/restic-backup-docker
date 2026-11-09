@@ -28,7 +28,7 @@ Pull requests, configured branch pushes and manual dispatches execute the same t
 1. `prepare` resolves one source commit and reads its commit timestamp. Every image job checks out that exact commit. The timestamp is passed both as `SOURCE_DATE_EPOCH` and a BuildKit build argument.
 2. `unit` installs checksum-pinned restic binaries, runs synthetic unit and local repository integration tests, and rejects empty or skipped test suites. The ownership suite runs with sudo on an ephemeral hosted runner and an environment allowlist containing only PATH/HOME/LANG and the two synthetic restic binary paths; this is necessary for actual chown tests, not a production privilege grant. No GitHub/cloud/production credentials are forwarded to that process. It also checks the harness self-test and shell syntax.
 3. `image-test` expands only `all` and `lite` across native Ubuntu AMD64 and ARM64 runners: four builds and four profile-specific E2E runs. Missing ARM64 capacity does not permit QEMU or an AMD64-only release. Runtime metadata must establish the reviewed runc floor; otherwise testing fails rather than reporting success.
-4. Each image is built once with its named target and loaded into the local daemon, without pushing. The E2E command is:
+4. Each image is built once with its named target by the pinned Buildx, with a real `--metadata-file`, and loaded into the local daemon without pushing. Build provenance is read from that file by the tested extractor; large metadata is never expanded into an environment variable or shell argument. The E2E command is:
 
    ```sh
    python3 tests/container_e2e.py --runtime-reviewed --runtime runc \
