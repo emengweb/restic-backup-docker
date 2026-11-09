@@ -2,7 +2,7 @@
 
 ## Status and ownership
 
-This is the local implementation of the final two-image release contract: **only the default all-in-one image and an opt-in lite image without database capability**. No database-specific or database-major-specific image tags are built or published. It has not been built, run, pushed or exercised on GitHub during this edit. Static checks are not container E2E evidence. Publishing remains disabled unless the repository owner explicitly enables it.
+Final release contract: **only the default all-in-one image and an opt-in lite image without database capability**. No database-specific or database-major-specific tags. [v2.0.3](https://github.com/emengweb/restic-backup-docker/actions/runs/42570334098) completed all four native image/E2E jobs, both shared-base jobs, four keyless-signed architecture publications and two signed indexes. Independent anonymous pull, exact GitHub-workflow OIDC index signatures, and all four architecture SBOM/provenance attestations were verified. That is real CI evidence, not static analysis or production acceptance.
 
 The implementation is in the [publication workflow](<../.github/workflows/docker-publish.yml>). The Lead owns Dockerfile targets and the container E2E harness; the runtime collector has a separate owner.
 
@@ -55,7 +55,7 @@ AMD64 and ARM64 naturally have different base blobs; no cross-architecture byte 
 
 Publication requires all test and shared-base jobs to succeed, a trusted `push` of a validated version tag, repository variable `ENABLE_GHCR_PUBLISH=true`, and entry into `ghcr-release`. The owner must configure that environment with tag/deployment restrictions and required reviewers before enabling the variable. Environment protections and immutable/protected Git release tags are repository administration, not settings this YAML can enforce. Manual dispatch and PRs cannot publish.
 
-Write permissions are scoped only to publication jobs: `packages: write` and `id-token: write`; `contents` remains read-only. Login uses the short-lived job `GITHUB_TOKEN`, never a long-lived registry password or production credential. Actions, BuildKit, Buildx, cosign and Syft are pinned. Download/hash/load/identity checks precede GHCR login; write authority is not exposed to a checked-out source script.
+Write permissions are scoped only to publication jobs: `packages: write` and `id-token: write`; `contents` remains read-only. Login uses the short-lived job `GITHUB_TOKEN`, never a long-lived registry password or production credential. Actions, BuildKit and Buildx are pinned; static Syft/Cosign tools are extracted without executing their source image from reviewed official manifests, with raw SHA256 verification. Checkout runs before evidence download so clean cannot remove it. Only the exact trusted release commit is checked out; its tool-extraction script executes in a write-scoped job and is part of the trusted release boundary. PR/test jobs have no package/OIDC write grant. Download/hash/load/identity checks precede GHCR login.
 
 For each profile/architecture, the publish job:
 
