@@ -124,7 +124,11 @@ data:
   BACKUP_MIN_FREE_BYTES: "268435456"
 ```
 
-## 5. K3s/Kubernetes：init 恢复 + sidecar 备份
+## 5. Docker Compose：备份与恢复示例
+
+完整示例见 [Docker Compose 备份/恢复文档](<docs/DOCKER-COMPOSE-EXAMPLE.md>)，包含 lite 文件场景、all + MariaDB 11.8.9、Docker secrets、独立 scratch、自动最新恢复及恢复前停止写入方的流程。生产必须替换示例 digest、仓库和 Secret，不得直接复制示例凭据。
+
+## 6. K3s/Kubernetes：init 恢复 + sidecar 备份
 
 下面是**合并到现有工作负载的 Pod spec 片段，不是完整可直接 apply 的 Deployment**。原应用容器、探针、端口、调度和存储声明保持原样；不要用这个只显示 backup 的 `containers` 数组覆盖原数组。示例假定 `app-data` PVC、`backup-settings` ConfigMap 和 `backup-repository` Secret 已由管理员创建，并且仓库已有可用备份。
 
