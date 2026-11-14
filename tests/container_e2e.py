@@ -623,10 +623,9 @@ class HarnessTests(unittest.TestCase):
             real_stat, real_lstat = Path.stat, Path.lstat
             def mapped(path, *, follow_symlinks=True):
                 result = real_stat(path, follow_symlinks=follow_symlinks)
-                if path == marker:
-                    return result
                 values = list(result)
-                values[4] = values[5] = 999
+                # Pure synthetic stat mapping must not depend on the host runner UID.
+                values[4] = values[5] = 0 if path == marker else 999
                 return os.stat_result(values)
             def mapped_link(path):
                 return mapped(path, follow_symlinks=False)
