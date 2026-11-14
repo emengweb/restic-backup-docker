@@ -9,8 +9,8 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 DOC = ROOT / 'docs/DOCKER-COMPOSE-EXAMPLE.md'
-ALL = 'ghcr.io/emengweb/restic-backup-docker@sha256:52c23fa4bd6fa439a4b8e358edc01113aa45337402452e90dff38a388b69f22f'
-LITE = 'ghcr.io/emengweb/restic-backup-docker@sha256:16059ef22add33989b495593e754103b7daf6ecdafe5f14e423d4c97238000ed'
+ALL = 'ghcr.io/emengweb/restic-backup-docker@sha256:99e223490722abcf1d487b2b61f506f8973767527a0a5cafc242b26df9b3d8fd'
+LITE = 'ghcr.io/emengweb/restic-backup-docker@sha256:e5941cde08b394ffb219c2948522830a20782b433f6d6e853f28f8aa5d3ac667'
 FENCE = chr(96) * 3
 
 
@@ -71,6 +71,44 @@ class ComposeDocsTests(unittest.TestCase):
     def setUpClass(cls):
         cls.text = DOC.read_text(encoding='utf-8')
         cls.configs = marked_blocks(cls.text, 'yaml', '# compose-example: ')
+
+    def test_v206_signed_release_pins_match_readme_and_compose(self):
+        readme = (ROOT / 'README.md').read_text()
+        for digest in (ALL, LITE):
+            self.assertIn(digest, readme)
+            self.assertIn(digest, self.text)
+        for text in (readme, self.text):
+            self.assertIn('v2.0.6', text)
+            self.assertIn('43548816524', text)
+            self.assertIn('a559517036054cdf9fb1a0e62345f2fd88e488b5', text)
+        for old in ('52c23fa4bd6fa439a4b8e358edc01113aa45337402452e90dff38a388b69f22f',
+                    '16059ef22add33989b495593e754103b7daf6ecdafe5f14e423d4c97238000ed'):
+            self.assertNotIn(old, self.text)
+            self.assertNotIn(old, readme)
+
+    def test_maria_v206_compatibility_and_explicit_authentication_contract(self):
+        readme = (ROOT / 'README.md').read_text()
+        for text in (readme, self.text):
+            for required in ('proxy_grants', 'global_grant_option', 'user@host',
+                             'RESTORE_MARIADB_ACCOUNT_PASSWORDS_FILE', 'fail-closed', '旧MariaDB',
+                             'v2.0.5', 'v2.0.3 lite', 'v2.0.4 all'):
+                self.assertIn(required, text)
+            self.assertIn('自动升级', text)
+            self.assertIn('未完成发布', text)
+            self.assertIn('旧仓库', text)
+        environment = self.configs['mariadb']
+        self.assertNotIn('RESTORE_MARIADB_ACCOUNT_PASSWORDS_FILE:', environment)
+        self.assertNotIn('RESTORE_ROLE_PASSWORDS_FILE:', environment)
+        self.assertNotIn('RESTORE_MAX_AGE_SECONDS: 0', environment)
+
+    def test_publishing_lessons_distinguish_actual_failures_from_success(self):
+        lessons = (ROOT / 'docs/GHCR-PUBLISHING-LESSONS.md').read_text()
+        for receipt in ('43544760801', '43545271593', '43547130746', '43548816524'):
+            self.assertIn(receipt, lessons)
+        for invariant in ('non-root', 'stat', 'journal', 'Grant_priv', 'global_grant_option',
+                          'mariadb_default_auth_or_grants_changed', '未完成发布', '窄范围'):
+            self.assertIn(invariant, lessons)
+        self.assertIn('不是已经证明运行时', lessons)
 
     def test_two_complete_service_graphs(self):
         self.assertEqual(set(self.configs), {'files', 'mariadb'})

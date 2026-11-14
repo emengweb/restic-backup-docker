@@ -5,10 +5,14 @@
 ## 0. 先理解镜像入口与适用范围
 
 - 本项目 Dockerfile 已设置 `ENTRYPOINT ["python3", "-m", "k3s_backup"]`。所以 Compose 的正确写法是 `command: ["schedule"]`、`command: ["restore-init"]`，CLI 覆盖为 `docker compose run --rm backup health`；**不能再追加一遍 python/module 入口**。
-- 当前固定版本 v2.0.4：all index `sha256:52c23fa4bd6fa439a4b8e358edc01113aa45337402452e90dff38a388b69f22f`，lite index `sha256:16059ef22add33989b495593e754103b7daf6ecdafe5f14e423d4c97238000ed`。init 和 backup 必须同一变体、同一 digest。
+- 当前固定版本为已签名发布的 v2.0.6：all index `sha256:99e223490722abcf1d487b2b61f506f8973767527a0a5cafc242b26df9b3d8fd`，lite index `sha256:e5941cde08b394ffb219c2948522830a20782b433f6d6e853f28f8aa5d3ac667`。init 和 backup 必须同一变体、同一 digest。
 - 使用 Docker Compose V2，须支持 `depends_on.condition: service_completed_successfully`。它只保证 **Compose 启动流程**的先后关系；不能阻止其他 Compose project、手工 `docker start` 或 daemon 对原容器的 restart policy 绕过门槛。示例业务 `restart: "no"`，需要受门控的进程管理器再考虑自动重启。
 - 目标必须是已确认的新/空卷，或该 runner 有权继续的恢复 journal。非空无标记目录默认 `skipped` 是保护旧数据，不是刚从仓库恢复的证据。空目标无兼容快照/认证/TLS/网络失败时恢复非零退出，主服务必须保持停止。没有自动 `restic init`、`unlock`、清空目录或启动空数据库。
 - `DATASET_ID` 稳定且与原快照一致，不能来自新 hostname/Pod/节点名。已有仓库之前依赖 URI-derived identity 时不要随意新增不同 ID；应沿用原身份。Compose 本地 volume 不自动跨节点复制；跨主机恢复需在新节点正确重建挂载、连接原仓库并隔离旧写入者。
+
+### 发布与旧部署不混为一谈
+
+本例使用[v2.0.6](<https://github.com/emengweb/restic-backup-docker/releases/tag/v2.0.6>)固定index，源提交`a559517036054cdf9fb1a0e62345f2fd88e488b5`；[正式CI43548816524](<https://github.com/emengweb/restic-backup-docker/actions/runs/43548816524>)及Lead独立签名及all/lite×amd64/arm64四份架构SBOM+provenance核验已通过。v2.0.5在真实native恢复E2E失败、未完成发布，不可使用。文档更新不会把已迁v2.0.3 lite或v2.0.4 all自动升级；现有部署要保持原digest，直到单独批准且完成该实例恢复验收。
 
 ## 1. 非敏感配置与真实 Secret 文件
 
@@ -58,7 +62,7 @@ Compose 本地 `secrets.file` 通常是只读 bind mount，**不是 Docker 自�
 ```yaml
 # compose-example: files
 name: restic-files-example
-x-lite-image: &lite-image ghcr.io/emengweb/restic-backup-docker@sha256:16059ef22add33989b495593e754103b7daf6ecdafe5f14e423d4c97238000ed
+x-lite-image: &lite-image ghcr.io/emengweb/restic-backup-docker@sha256:e5941cde08b394ffb219c2948522830a20782b433f6d6e853f28f8aa5d3ac667
 x-helper-security: &helper-security
   user: "0:0"
   read_only: true
@@ -155,14 +159,18 @@ Compose `depends_on` 是额外启动保护，不替代上面的停写、fresh re
 - **这里恢复/主服务都为11.8系列。** `MARIADB_IMAGE` 必须是管理员核验的 MariaDB11.8.9 官方主镜像固定 digest，需匹配目标 UID/GID/架构，并先做续启验收。不要填写11.5镜像，也不允许11.8打开旧11.5物理卷。迁移11.5→11.8必须先新卷逻辑预演、停写最终快照、验证后切换并保留旧卷；不是直接套本 Compose。
 - `MARIADB_USER=app` 通常只具有 `app.*` 权限，**不够**当前导出器读取 `mysql.user`、`mariadb-dump --system=users` 所需的完整 users/roles/grants，也不能把省略 globals 当成功。
 - 为提供可执行的**管理员级参考基线**，本例只在共享 Unix socket 上使用 `root@localhost` + 已有 root Secret 导出所有 globals（及显式列出的库），不设置 `MARIADB_ROOT_HOST=%`，不开放数据库宿主端口，也不把 root 密钥交给普通应用。备份服务只挂 socket，不挂 datadir。
-- 此 root 模型是高权限取舍，不宣称最小权限。生产若换专用 backup 账号，须管理员根据源版本和所有账户/权限实际验收对库数据、views/routines/events/triggers、系统账户/角色、`SHOW CREATE USER`、`SHOW GRANTS`、认证 plugin/hash 和 PROXY 的完整访问，不能只授 `SELECT ON app.*`。Globals 恢复还需要授权/PROXY能力：当前源码 helper 在自建隔离库内赋予临时账户 `GRANT ALL ... WITH GRANT OPTION` 与 `GRANT PROXY ... WITH GRANT OPTION`，这不是给源应用账户或生产库自动提权。文档固定digest不是把本地源码变更自动发布：实际使用前须对该已发布artifact验收完整globals/PROXY恢复；如果artifact缺能力应保持停止，由维护者发布验证过的修复版本，不能跳过globals或改为空库启动。
+- 此 root 模型是高权限取舍，不宣称最小权限。生产若换专用 backup 账号，须管理员根据源版本和所有账户/权限实际验收对库数据、views/routines/events/triggers、系统账户/角色、`SHOW CREATE USER`、`SHOW GRANTS`、认证 plugin/hash 和 PROXY 的完整访问，不能只授 `SELECT ON app.*`。Globals 恢复还需要授权/PROXY能力：v2.0.6 helper在自建隔离库内赋予临时账户`GRANT ALL ... WITH GRANT OPTION`与`GRANT PROXY ... WITH GRANT OPTION`，这不是给源应用账户或生产库自动提权。恢复会清理非源seed账号，并精确核对原账号、PROXY及全局GRANT OPTION；因原生重放额外增加的全局转授权只按源证据撤销，且必须保持库/表/列/例程授权不变。已签名artifact和真实双架构合成验证也不能替代具体生产仓库/主镜像/应用身份验收；失败时保持停止，不能跳过globals或改为空库启动。
 
-先安全准备 `secrets/db-root-password`（原库 root 密码，不是新造占位值）。若主镜像初始化变量用于一个已有完整 datadir，它们一般不会重建用户/改密码；恢复出的应用身份/权限来自 globals，必须另行用业务用户验证。此例无 `MARIADB_DATABASE/MARIADB_USER/MARIADB_PASSWORD` 自动建库配置，避免把缺备份误作首次部署。
+先安全准备 `secrets/db-root-password`（原库root密码，不是新造占位值）。若主镜像初始化变量用于已有完整datadir，它们一般不会重建用户/改密码；恢复出的身份/权限来自globals，必须用实际业务用户验证。此例无`MARIADB_DATABASE/MARIADB_USER/MARIADB_PASSWORD`自动建库配置，避免把缺备份误作首次部署。
+
+**v2.0.6必须先有新格式完整MariaDB备份：** 原生globals按每个`user@host`保留认证plugin与凭据摘要；`DATABASE_PASSWORD_FILE`仅供连接源库，不会覆盖同名其他host或socket认证。manifest须同时含`proxy_grants`精确五元组及`login_accounts`中逐账号`global_grant_option`布尔，缺失时恢复fail-closed。旧MariaDB归档需要先用v2.0.6重新完整导出并验证，不能只改init镜像、关闭年龄门槛或沿用缺metadata归档；旧仓库/快照保留。
+
+默认**不配置任何认证覆写文件**。确需调整特定账号时，仅使用`RESTORE_MARIADB_ACCOUNT_PASSWORDS_FILE`指向执行者拥有的0600普通非symlink私有JSON，schema1中的每条必须显式指定`user/host/plugin/password`，仅支持`mysql_native_password`覆写；没有列出的host不变，文件内容不得进入日志/Git。不要给MariaDB设置PG专用`RESTORE_ROLE_PASSWORDS_FILE`，也不要把备份连接root口令当所有账号密码。下面例子故意不创建或挂载覆写文件。
 
 ```yaml
 # compose-example: mariadb
 name: restic-mariadb-example
-x-all-image: &all-image ghcr.io/emengweb/restic-backup-docker@sha256:52c23fa4bd6fa439a4b8e358edc01113aa45337402452e90dff38a388b69f22f
+x-all-image: &all-image ghcr.io/emengweb/restic-backup-docker@sha256:99e223490722abcf1d487b2b61f506f8973767527a0a5cafc242b26df9b3d8fd
 x-helper-security: &helper-security
   user: "0:0"
   read_only: true
