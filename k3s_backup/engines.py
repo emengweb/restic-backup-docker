@@ -962,6 +962,89 @@ def _maria_target(config, source):
     return target
 
 
+def _maria_proxy_query():
+    return ("SELECT COALESCE(JSON_ARRAYAGG(JSON_OBJECT('user',User,'host',Host,"
+            "'proxied_user',Proxied_user,'proxied_host',Proxied_host,"
+            "'with_grant',IF(With_grant=1,TRUE,FALSE))),JSON_ARRAY()) FROM mysql.proxies_priv;")
+
+
+def _maria_proxy_grants(value, accounts):
+    """Validate exact semantic tuples, not native GRANT's normalized host text."""
+    if not isinstance(value, list) or len(value) > 100000:
+        _fail("invalid_mariadb_proxy_metadata", "MariaDB PROXY metadata must be an explicit bounded list")
+    known = {(item["user"], item["host"]) for item in accounts}
+    result, seen = [], set()
+    fields = ("user", "host", "proxied_user", "proxied_host")
+    for grant in value:
+        if not isinstance(grant, dict) or set(grant) != {*fields, "with_grant"}:
+            _fail("invalid_mariadb_proxy_metadata", "MariaDB PROXY metadata has invalid fields")
+        for field in fields:
+            text = grant[field]
+            if (not isinstance(text, str) or any(ord(c) < 32 for c in text)
+                    or len(text) > 255):
+                _fail("invalid_mariadb_proxy_metadata", "MariaDB PROXY account metadata contains invalid text")
+            try:
+                text.encode("utf-8")
+            except UnicodeError:
+                _fail("invalid_mariadb_proxy_metadata", "MariaDB PROXY account metadata contains invalid text")
+        if type(grant["with_grant"]) is not bool:
+            _fail("invalid_mariadb_proxy_metadata", "MariaDB PROXY grant option must be an explicit boolean")
+        identity = tuple(grant[field] for field in fields)
+        if identity in seen:
+            _fail("invalid_mariadb_proxy_metadata", "MariaDB PROXY metadata repeats an account pair")
+        if identity[:2] not in known:
+            _fail("unknown_mariadb_proxy_account", "A MariaDB PROXY grantee is absent from snapshot accounts")
+        # Empty proxied_user is MariaDB's wildcard/anonymous PROXY target;
+        # an empty host is meaningful and MUST NOT be normalized to percent.
+        if grant["proxied_user"] and identity[2:] not in known:
+            _fail("unknown_mariadb_proxy_account", "A MariaDB PROXY target is absent from snapshot accounts")
+        seen.add(identity)
+        result.append(dict(grant))
+    return sorted(result, key=lambda grant: tuple(grant[field] for field in fields))
+
+
+def _maria_proxy_read(config, options, accounts):
+    raw = _json_output(_maria_query(config, options, _maria_proxy_query()))
+    if not isinstance(raw, list):
+        _fail("invalid_mariadb_proxy_metadata", "MariaDB PROXY query returned invalid metadata")
+    # MariaDB JSON_OBJECT renders IF(...,TRUE,FALSE) as numeric 0/1.
+    for grant in raw:
+        if isinstance(grant, dict) and type(grant.get("with_grant")) is int and grant["with_grant"] in (0, 1):
+            grant["with_grant"] = bool(grant["with_grant"])
+    return _maria_proxy_grants(raw, accounts)
+
+
+def _maria_verify_logins(config, options, accounts, bootstrap):
+    identities = {(item["user"], item["host"]) for item in accounts} | {(bootstrap, "localhost")}
+    predicates = ["(BINARY User=" + _maria_literal(user) + " AND BINARY Host=" + _maria_literal(host) + ")"
+                  for user, host in sorted(identities)]
+    size = str(len(identities))
+    sql = "SELECT IF(COUNT(*)=" + size + " AND SUM(" + " OR ".join(predicates) + ")=" + size + ",1,0) FROM mysql.user WHERE is_role='N';"
+    if _maria_query(config, options, sql).stdout.strip() != b"1":
+        _fail("mariadb_account_restore_mismatch", "Restored MariaDB login accounts differ from snapshot metadata")
+
+
+def _maria_proxy_sync(config, options, grants, accounts, bootstrap):
+    """Only called on this adapter's fresh, socket-only, unpublished target.
+
+    Modify only mysql.proxies_priv semantic columns. All other mysql tables
+    remain owned by native users/grants import. The bootstrap account keeps its
+    global ALL privileges; its import-only PROXY is no longer needed here.
+    """
+    expected = _maria_proxy_grants(grants, accounts)
+    values = []
+    for grant in expected:
+        values.append("(" + ",".join(_maria_literal(grant[field]) for field in
+                                     ("host", "user", "proxied_host", "proxied_user"))
+                      + "," + ("1" if grant["with_grant"] else "0") + ")")
+    sql = "DELETE FROM mysql.proxies_priv;"
+    if values:
+        sql += "INSERT INTO mysql.proxies_priv (Host,User,Proxied_host,Proxied_user,With_grant) VALUES " + ",".join(values) + ";"
+    _maria_query(config, options, sql + " FLUSH PRIVILEGES;")
+    if _maria_proxy_read(config, options, accounts) != expected:
+        _fail("mariadb_proxy_restore_mismatch", "Restored MariaDB PROXY permissions differ from snapshot metadata")
+
+
 def _maria_innodb(config, options, names):
     literal = ",".join(_maria_literal(n) for n in names)
     result = _maria_query(config, options, "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA IN (" + literal + ") AND TABLE_TYPE='BASE TABLE' AND (ENGINE IS NULL OR ENGINE <> 'InnoDB');")
@@ -987,6 +1070,7 @@ def _export_mariadb(config, stage):
         users = _json_output(_maria_query(config, options, "SELECT COALESCE(JSON_ARRAYAGG(JSON_OBJECT('user',User,'host',Host)),JSON_ARRAY()) FROM mysql.user WHERE is_role='N';"))
         if not isinstance(users, list) or any(not isinstance(u, dict) or not isinstance(u.get("user"), str) or not isinstance(u.get("host"), str) for u in users):
             _fail("invalid_database_metadata", "MariaDB account metadata is invalid")
+        proxy_grants = _maria_proxy_read(config, options, users)
         # --replace globals preserves grant/account attributes, including auth hashes.
         _call(config, [_maria_bin(config, "dump"), "--defaults-file=" + str(options), "--system=users", "--replace",
                        "--skip-comments"], stdout_path=stage / "globals.sql")
@@ -996,8 +1080,10 @@ def _export_mariadb(config, stage):
         _archive(stage, "globals.sql")
         _archive(stage, "databases.sql")
         _maria_innodb(config, options, names)
+        if _maria_proxy_read(config, options, users) != proxy_grants:
+            _fail("mariadb_proxy_changed_during_export", "MariaDB PROXY permissions changed during export; quiesce account changes")
     return {"engine": "mariadb", "source_major": source, "target_major": target, "databases": entries,
-            "globals": "globals.sql", "login_accounts": users, "globals_contains_auth_hash": True,
+            "globals": "globals.sql", "login_accounts": users, "proxy_grants": proxy_grants, "globals_contains_auth_hash": True,
             "consistency": "single-transaction-InnoDB-all-declared-databases;globals-separate;quiesce-ddl"}
 
 
@@ -1081,6 +1167,9 @@ def _restore_mariadb(config, stage, target, info):
     source_accounts = {(a["user"], a["host"]) for a in accounts}
     if len(source_accounts) != len(accounts):
         _fail("invalid_database_metadata", "MariaDB login account metadata contains duplicate identities")
+    if "proxy_grants" not in info:
+        _fail("mariadb_proxy_metadata_required", "This snapshot lacks exact MariaDB PROXY metadata; a new verified export is required")
+    proxy_grants = _maria_proxy_grants(info["proxy_grants"], accounts)
     overrides = _maria_account_passwords(config)
     if set(overrides) - source_accounts:
         _fail("unknown_restore_account", "An explicit password mapping references an absent MariaDB user and host")
@@ -1107,8 +1196,14 @@ def _restore_mariadb(config, stage, target, info):
                 for account in seed:
                     if not isinstance(account, dict) or not isinstance(account.get("user"), str) or not isinstance(account.get("host"), str):
                         _fail("invalid_database_metadata", "Fresh MariaDB account metadata is invalid")
-                    if account["user"] in {"", "root"} and (account["user"], account["host"]) not in source_accounts:
-                        remove += "DROP USER IF EXISTS " + _maria_account(account["user"], account["host"]) + ";\n"
+                    key = (account["user"], account["host"])
+                    if key not in source_accounts and key != (bootstrap, "localhost"):
+                        # mariadb.sys defines mysql.user and related system views.
+                        # Retaining an extra account or deleting that definer is
+                        # not an exact/safe restore: require a complete source.
+                        if account["user"] == "mariadb.sys":
+                            _fail("mariadb_system_account_metadata_required", "Source metadata lacks an installed MariaDB system view account")
+                        remove += "DROP USER IF EXISTS " + _maria_account(*key) + ";\n"
                 # Import native globals before cleaning fresh-install accounts.
                 # In particular, mariadb.sys owns privilege-system views and must
                 # not be removed: deleting it breaks native account operations.
@@ -1118,12 +1213,16 @@ def _restore_mariadb(config, stage, target, info):
                     actual = _json_output(_maria_query(config, options, "SELECT JSON_OBJECT('name',SCHEMA_NAME,'character_set',DEFAULT_CHARACTER_SET_NAME,'collation',DEFAULT_COLLATION_NAME) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME=" + _maria_literal(item["name"]) + ";"))
                     if any(actual.get(k) != item.get(k) for k in ("name", "character_set", "collation")):
                         _fail("database_restore_mismatch", "Restored MariaDB charset or collation differs from the snapshot")
-                # Fresh anonymous/passwordless root accounts absent from the
-                # source are removed only after all native import work completes.
-                # Native globals own all source plugins, verifiers and grants.
-                # Never turn connection credentials into implicit ALTER USERs.
+                # Only this newly initialized unpublished target is changed.
+                # Remove all source-absent seed logins (including the numeric
+                # helper's NSS name), not just root/anonymous defaults.
+                _maria_query(config, options, remove)
+                # Native globals own authentication. Exact PROXY metadata, not
+                # GRANT text normalization, owns the final proxy permission set.
                 _maria_auth_override(config, options, overrides)
-                _maria_query(config, options, remove + "DROP USER " + _maria_account(bootstrap, "localhost") + "; FLUSH TABLES;")
+                _maria_verify_logins(config, options, accounts, bootstrap)
+                _maria_proxy_sync(config, options, proxy_grants, accounts, bootstrap)
+                _maria_query(config, options, "SET sql_mode=''; DROP USER " + _maria_account(bootstrap, "localhost") + "; FLUSH TABLES;")
         _fsync_tree(target)
 
 

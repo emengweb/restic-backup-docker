@@ -421,6 +421,15 @@ def maria_auth_state(socket_path, password):
     return state
 
 
+def maria_proxy_state(socket_path, password, accounts):
+    from k3s_backup.engines import _maria_proxy_grants, _maria_proxy_query
+    value = json.loads(maria_sql(socket_path, _maria_proxy_query(), password).stdout)
+    for grant in value:
+        if type(grant.get("with_grant")) is int and grant["with_grant"] in (0, 1):
+            grant["with_grant"] = bool(grant["with_grant"])
+    return _maria_proxy_grants(value, [{"user": user, "host": host} for user, host in accounts])
+
+
 def mariadb_e2e(final_uid=998):
     password = "synthetic-database-only"
     case = "mariadb" if final_uid == 998 else "maria-final-uid" + str(final_uid)
@@ -472,7 +481,13 @@ def mariadb_e2e(final_uid=998):
                         if test.returncode:
                             known = account["user"] if account["user"] in {"root", "mysql", "mariadb.sys", "mysql.sys", "PUBLIC", "fixture_reader", ""} else "other"
                             print("DIAG account_ordinal=" + str(ordinal) + "_known=" + known + "_role=" + account["role"] + "_op=" + operation.split()[1] + "_rc=" + str(test.returncode), flush=True)
+            # Construct an exact historical empty-host target, which native
+            # GRANT PROXY replay can normalize to percent. Test only fixtures.
+            maria_sql(source_socket, "INSERT INTO mysql.proxies_priv (Host,User,Proxied_host,Proxied_user,With_grant) VALUES "
+                      "('localhost','fixture_multi','','',1),('%','fixture_multi','%','',0); FLUSH PRIVILEGES;", password)
             auth_baseline = maria_auth_state(source_socket, password)
+            proxy_baseline = maria_proxy_state(source_socket, password, auth_baseline)
+            require(any(grant["proxied_host"] == "" for grant in proxy_baseline), "mariadb_proxy_fixture_empty_host_missing")
             local_grants_query = "SELECT * FROM mysql.db WHERE User='fixture_multi' AND Host='localhost' ORDER BY Db;"
             local_grants = maria_sql(source_socket, local_grants_query, password).stdout
             require(auth_baseline[("fixture_multi", "localhost")]["authentication"] != auth_baseline[("fixture_multi", "%")]["authentication"], "mariadb_fixture_host_auth_not_distinct")
@@ -485,6 +500,7 @@ def mariadb_e2e(final_uid=998):
         restored_runtime = maria_runtime(root, "restored-runtime", final_uid, final_uid)
         restored_socket = restored_runtime / "server.sock"
         with maria_server(target, restored_socket, restored_runtime, password=password, uid=final_uid, gid=final_uid):
+            require(maria_proxy_state(restored_socket, password, auth_baseline) == proxy_baseline, "mariadb_exact_proxy_metadata_changed")
             require(maria_auth_state(restored_socket, password) == auth_baseline, "mariadb_default_auth_or_grants_changed")
             for database in ("fixture_a", "fixture_b"):
                 actual = maria_sql(restored_socket, query(database), password).stdout
@@ -508,6 +524,7 @@ def mariadb_e2e(final_uid=998):
             override_runtime = maria_runtime(root, "override-runtime", final_uid, final_uid)
             override_socket = override_runtime / "server.sock"
             with maria_server(override_target, override_socket, override_runtime, password=password, uid=final_uid, gid=final_uid):
+                require(maria_proxy_state(override_socket, password, auth_baseline) == proxy_baseline, "mariadb_override_proxy_metadata_changed")
                 changed = maria_auth_state(override_socket, password)
                 key = ("fixture_multi", "localhost")
                 require(set(changed) == set(auth_baseline), "mariadb_override_changed_account_set")
@@ -574,6 +591,16 @@ class HarnessTests(unittest.TestCase):
 
     def test_does_not_forward_host_credentials(self):
         self.assertFalse(any(k.startswith(("AWS", "RESTIC", "DATABASE", "KUBE")) for k in clean_env()))
+
+    def test_maria_proxy_state_keeps_empty_and_percent_targets_distinct(self):
+        accounts = {("fixture_multi", "localhost"): {}, ("fixture_multi", "%"): {}}
+        value = [{"user": "fixture_multi", "host": "localhost", "proxied_user": "", "proxied_host": "", "with_grant": 1},
+                 {"user": "fixture_multi", "host": "%", "proxied_user": "", "proxied_host": "%", "with_grant": 0}]
+        result = subprocess.CompletedProcess([], 0, json.dumps(value).encode(), b"")
+        with mock.patch.object(sys.modules[__name__], "maria_sql", return_value=result):
+            metadata = maria_proxy_state(Path("/synthetic.sock"), "synthetic-only", accounts)
+        self.assertEqual({grant["proxied_host"] for grant in metadata}, {"", "%"})
+        self.assertTrue(all(type(grant["with_grant"]) is bool for grant in metadata))
 
     def test_maria_uid999_uses_numeric_identity_not_packaged_mysql(self):
         argv = maria_owner_command(["mariadbd", "--no-defaults"], 999, 999)
@@ -668,6 +695,11 @@ def main(argv=None):
             if rc: return rc
         return 0
     if args.self_test:
+        # Local self-tests import the public checkout package; inside the image
+        # PYTHONPATH already provides /opt/k3s-restic. No native code is run here.
+        checkout = str(Path(__file__).resolve().parents[1])
+        if checkout not in sys.path:
+            sys.path.insert(0, checkout)
         return 0 if unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(HarnessTests)).wasSuccessful() else 1
     if args.inside:
         inside(args.case)

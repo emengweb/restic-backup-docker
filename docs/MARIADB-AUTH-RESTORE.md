@@ -39,6 +39,60 @@ is stopped by its existing finally cleanup; no failed stage is published. A
 failed stage can retain bootstrap metadata on disk, is private/unpublished, and
 must never be started as an accepted application database.
 
+## Exact PROXY permission metadata and fresh-seed cleanup
+
+Native system-users SQL is not a complete PROXY round-trip proof: replay can
+normalize an empty Proxied_host into percent, and a new server also has seed
+accounts/grants absent from the source. New MariaDB snapshots therefore contain
+an explicit engine.proxy_grants list of exact semantic records:
+
+~~~json
+[{"user":"synthetic","host":"localhost","proxied_user":"","proxied_host":"","with_grant":true}]
+~~~
+
+All five fields are mandatory; no extra fields, duplicates or coercion of null,
+string/numeric grant options are accepted in a manifest. Empty proxied_user is
+MariaDB's wildcard/anonymous PROXY target sentinel, and an empty proxied_host
+remains distinct from percent. Grantees must match an exact captured login
+account. A nonempty proxied_user must also match an exact captured target
+account. The metadata records semantic permissions only, not Grantor or the
+system-table timestamp. Export captures this read-only metadata alongside
+native globals and rechecks the PROXY set at the end; concurrent changes fail
+rather than claiming one consistent account snapshot. Account/DDL changes must
+still be quiesced. The metadata stays in the encrypted snapshot, never logs.
+
+**Older snapshots without proxy_grants fail closed before the helper starts**
+with mariadb_proxy_metadata_required. They are not treated as an empty PROXY
+set and are not repaired from ambiguous GRANT text. Take a new verified export
+or use a separately reviewed offline migration with proven source metadata;
+do not guess missing permissions.
+
+Only this adapter's newly initialized, unpublished, socket-only private target
+is reconciled. After native globals/data import, source-absent fresh seed login
+accounts (including an OS-user seed named postgres/mysql) are dropped, while
+the internal bootstrap remains available. If the installed mariadb.sys definer
+account is absent from source metadata, restore refuses rather than keeping an
+extra account or breaking privilege-system views. The imported login set must
+match the source plus the temporary bootstrap exactly.
+
+The adapter then replaces **only mysql.proxies_priv** with the validated exact
+five-tuples, flushes privileges and reads the five-tuple set back for equality.
+It neither imports all mysql system tables nor changes source authentication.
+The import-only bootstrap PROXY grant is not retained; its global ALL privileges
+remain available until final DROP USER. The random bootstrap identity cannot
+collide with a source username, and final bootstrap removal does not target
+source proxy rows. Any DML, flush, account-set or readback error stops restoration
+without publication; partial system-table updates are confined to that failed
+private target, not claimed atomic or a usable DB.
+
+The synthetic native E2E design now includes empty-host and percent PROXY targets,
+checks exact system-table five-tuple equality before full SHOW CREATE USER /
+SHOW GRANTS equality for both normal and explicit-host override restores. No
+SHOW guard is disabled. Cross-version quoting differences in SHOW output are a
+separate display-format issue, not permission normalization; this harness uses
+the same MariaDB11.8 source/target and retains its raw same-version guard. Actual
+native execution of this update remains NOT RUN in this task.
+
 ## Optional exact-account override (explicit credential migration)
 
 Do not configure this to obtain ordinary preservation. Use it only when a

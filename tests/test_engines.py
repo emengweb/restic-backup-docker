@@ -31,7 +31,7 @@ def pg_info(names=("alpha",)):
 def maria_info(names=("alpha", "beta")):
     return {"engine": "mariadb", "source_major": "11.8", "target_major": "11.8",
             "databases": [{"name": n, "archive": "databases.sql", "character_set": "utf8mb4", "collation": "utf8mb4_unicode_ci"} for n in names],
-            "globals": "globals.sql", "login_accounts": [{"user": "app_owner", "host": "%"}]}
+            "globals": "globals.sql", "login_accounts": [{"user": "app_owner", "host": "%"}], "proxy_grants": []}
 
 
 class EnginesTests(unittest.TestCase):
@@ -109,6 +109,10 @@ class EnginesTests(unittest.TestCase):
             sql = kw.get("input_data", b"").decode()
             if "SELECT VERSION()" in sql:
                 return Result(0, b"11.8.9-MariaDB-deb12\n")
+            if "FROM mysql.proxies_priv" in sql and "JSON_ARRAYAGG" in sql:
+                return Result(0, b"[]\n")
+            if "SELECT IF(COUNT(*)=" in sql:
+                return Result(0, b"1\n")
             if "COUNT(*)" in sql:
                 return Result(0, b"0\n")
             if "JSON_ARRAYAGG" in sql:
@@ -535,6 +539,132 @@ class EnginesTests(unittest.TestCase):
             self.error("restore_bootstrap_collision", lambda: self.maria_restore(info))
         self.assertFalse(any(argv == ["server-start"] for argv, _ in self.calls))
 
+    def test_maria_proxy_metadata_empty_host_percent_and_host_specific_preserved(self):
+        accounts = [{"user": "root", "host": "localhost"}, {"user": "root", "host": "%"}]
+        grants = [{"user": "root", "host": "localhost", "proxied_user": "", "proxied_host": "", "with_grant": True},
+                  {"user": "root", "host": "%", "proxied_user": "", "proxied_host": "%", "with_grant": False}]
+        actual = engines._maria_proxy_grants(grants, accounts)
+        self.assertEqual({item["proxied_host"] for item in actual}, {"", "%"})
+        self.assertEqual(actual, engines._maria_proxy_grants(list(reversed(grants)), accounts))
+        sql_calls = []
+        def query(config, options, sql):
+            sql_calls.append(sql)
+            if "JSON_ARRAYAGG" in sql:
+                return Result(0, json.dumps(grants).encode())
+            return Result(0)
+        with patch.object(engines, "_maria_query", side_effect=query):
+            engines._maria_proxy_sync(self.cfg, "unused", actual, accounts, "synthetic_bootstrap")
+        self.assertTrue(sql_calls[0].startswith("DELETE FROM mysql.proxies_priv;INSERT INTO mysql.proxies_priv"))
+        self.assertIn("CONVERT(X'' USING utf8mb4)", sql_calls[0])
+        self.assertIn("CONVERT(X'25' USING utf8mb4)", sql_calls[0])
+        self.assertIn("FLUSH PRIVILEGES", sql_calls[0])
+        self.assertNotIn("synthetic_bootstrap", sql_calls[0])
+        self.assertNotIn("UPDATE mysql.global_priv", sql_calls[0])
+
+    def test_maria_proxy_metadata_missing_or_malformed_fails_before_server(self):
+        info = maria_info()
+        del info["proxy_grants"]
+        self.error("mariadb_proxy_metadata_required", lambda: self.maria_restore(info))
+        valid = {"user": "app_owner", "host": "%", "proxied_user": "", "proxied_host": "", "with_grant": True}
+        for value in (None, {}, [valid, valid], [{**valid, "with_grant": 1}],
+                      [{**valid, "with_grant": "1"}], [{**valid, "extra": "ignored"}],
+                      [{key: value for key, value in valid.items() if key != "proxied_host"}],
+                      [{**valid, "proxied_host": "bad\0host"}], [{**valid, "proxied_host": "\ud800"}]):
+            with self.subTest(value=value):
+                info = maria_info()
+                info["proxy_grants"] = value
+                self.error("invalid_mariadb_proxy_metadata", lambda: self.maria_restore(info))
+        self.assertFalse(any(argv == ["server-start"] for argv, _ in self.calls))
+
+    def test_maria_proxy_metadata_unknown_grantee_or_named_target_rejected(self):
+        valid = {"user": "app_owner", "host": "%", "proxied_user": "", "proxied_host": "", "with_grant": True}
+        for grant in ({**valid, "host": "localhost"}, {**valid, "proxied_user": "missing"}):
+            info = maria_info()
+            info["proxy_grants"] = [grant]
+            self.error("unknown_mariadb_proxy_account", lambda: self.maria_restore(info))
+        self.assertEqual(engines._maria_proxy_grants([valid], maria_info()["login_accounts"]), [valid])
+
+    def test_maria_proxy_export_records_semantic_metadata_and_rechecks_changes(self):
+        self.cfg.engine, self.cfg.databases = "mariadb", ["alpha", "beta"]
+        grant = {"user": "app_owner", "host": "%", "proxied_user": "", "proxied_host": "", "with_grant": 1}
+        def native(argv, **kwargs):
+            result = self.fake_run(argv, **kwargs)
+            if b"FROM mysql.proxies_priv" in kwargs.get("input_data", b""):
+                return Result(0, json.dumps([grant]).encode())
+            return result
+        with patch.object(engines, "run", native):
+            info = engines.export_database(self.cfg, self.stage)
+        self.assertIs(info["proxy_grants"][0]["with_grant"], True)
+        self.assertEqual(info["proxy_grants"][0]["proxied_host"], "")
+
+    def test_maria_proxy_export_detects_changed_source_or_denied_metadata(self):
+        self.cfg.engine, self.cfg.databases = "mariadb", ["alpha", "beta"]
+        count = [0]
+        def drift(argv, **kwargs):
+            result = self.fake_run(argv, **kwargs)
+            if b"FROM mysql.proxies_priv" in kwargs.get("input_data", b""):
+                count[0] += 1
+                grants = [] if count[0] == 1 else [{"user": "app_owner", "host": "%", "proxied_user": "", "proxied_host": "", "with_grant": 1}]
+                return Result(0, json.dumps(grants).encode())
+            return result
+        with patch.object(engines, "run", drift):
+            self.error("mariadb_proxy_changed_during_export", lambda: engines.export_database(self.cfg, self.stage))
+
+    def test_maria_exact_proxy_restore_does_not_keep_seed_or_bootstrap_grants(self):
+        info = maria_info()
+        info["proxy_grants"] = [{"user": "app_owner", "host": "%", "proxied_user": "", "proxied_host": "", "with_grant": True}]
+        synced = [False]
+        def native(argv, **kwargs):
+            result = self.fake_run(argv, **kwargs)
+            sql = kwargs.get("input_data", b"")
+            if b"DELETE FROM mysql.proxies_priv" in sql:
+                synced[0] = True
+            if b"FROM mysql.proxies_priv" in sql and b"JSON_ARRAYAGG" in sql:
+                self.assertTrue(synced[0])
+                return Result(0, json.dumps(info["proxy_grants"]).encode())
+            return result
+        self.maria_restore(info, native)
+        sql = b"\n".join(k.get("input_data", b"") for _, k in self.calls)
+        self.assertIn(b"INSERT INTO mysql.proxies_priv", sql)
+        self.assertIn(b"DROP USER 'k3s_restore_", sql)
+        self.assertNotIn(b"ALTER USER", sql)
+        self.assertEqual("server-stopped", self.calls[-1][0][0])
+
+    def test_maria_proxy_readback_mismatch_or_query_denied_is_fatal(self):
+        info = maria_info()
+        info["proxy_grants"] = [{"user": "app_owner", "host": "%", "proxied_user": "", "proxied_host": "", "with_grant": True}]
+        self.error("mariadb_proxy_restore_mismatch", lambda: self.maria_restore(info))
+        self.assertEqual("server-stopped", self.calls[-1][0][0])
+        def denied(argv, **kwargs):
+            if b"DELETE FROM mysql.proxies_priv" in kwargs.get("input_data", b""):
+                raise BackupError("command_failed", "Synthetic PROXY permission denied")
+            return self.fake_run(argv, **kwargs)
+        self.error("command_failed", lambda: self.maria_restore(runner=denied))
+        self.assertEqual("server-stopped", self.calls[-1][0][0])
+
+    def test_maria_proxy_sync_clears_seed_grants_for_empty_source_set(self):
+        self.maria_restore()
+        sql = b"\n".join(k.get("input_data", b"") for _, k in self.calls)
+        self.assertIn(b"DELETE FROM mysql.proxies_priv; FLUSH PRIVILEGES;", sql)
+        self.assertNotIn(b"INSERT INTO mysql.proxies_priv", sql)
+        self.assertLess(sql.index(b"DELETE FROM mysql.proxies_priv"), sql.rindex(b"DROP USER 'k3s_restore_"))
+
+    def test_maria_extra_login_or_missing_system_view_account_fails_closed(self):
+        def extra(argv, **kwargs):
+            result = self.fake_run(argv, **kwargs)
+            if b"SELECT IF(COUNT(*)=" in kwargs.get("input_data", b""):
+                return Result(0, b"0\n")
+            return result
+        self.error("mariadb_account_restore_mismatch", lambda: self.maria_restore(runner=extra))
+        self.assertEqual("server-stopped", self.calls[-1][0][0])
+        def missing_sys(argv, **kwargs):
+            result = self.fake_run(argv, **kwargs)
+            if b"FROM mysql.user WHERE is_role='N'" in kwargs.get("input_data", b""):
+                return Result(0, json.dumps([{"user": "mariadb.sys", "host": "localhost"}]).encode())
+            return result
+        self.error("mariadb_system_account_metadata_required", lambda: self.maria_restore(runner=missing_sys))
+        self.assertEqual("server-stopped", self.calls[-1][0][0])
+
     def test_maria_restore_failure_stops_and_keeps_input(self):
         self.cfg.engine = "mariadb"
         self.cfg.databases = ["alpha", "beta"]
@@ -672,12 +802,14 @@ class LegacyAndLifecycleTests(unittest.TestCase):
         self.cfg.engine = "mariadb"
         self.cfg.databases = ["alpha", "beta"]
         info = maria_info()
+        info["login_accounts"].append({"user": "mariadb.sys", "host": "localhost"})
         EnginesTests.payload(self, info)
         def with_seed(argv, **kw):
             value = self.fake_run(argv, **kw)
-            if b"JSON_ARRAYAGG" in kw.get("input_data", b""):
+            if b"JSON_ARRAYAGG" in kw.get("input_data", b"") and b"FROM mysql.user" in kw.get("input_data", b""):
                 return Result(0, json.dumps([{"user": "root", "host": "localhost"}, {"user": "", "host": "localhost"},
-                                            {"user": "mariadb.sys", "host": "localhost"}, {"user": "mysql", "host": "localhost"}]).encode())
+                                            {"user": "mariadb.sys", "host": "localhost"}, {"user": "mysql", "host": "localhost"},
+                                            {"user": "postgres", "host": "localhost"}]).encode())
             return value
         with patch.object(engines, "run", with_seed), patch.object(engines, "_database_access", self.access), patch.object(engines, "_maria_server", self.server):
             engines.restore_database(self.cfg, self.stage, self.target, {"engine": info})
@@ -687,7 +819,8 @@ class LegacyAndLifecycleTests(unittest.TestCase):
         self.assertIn(b"DROP USER IF EXISTS 'root'@'localhost'", sql)
         self.assertIn(b"DROP USER IF EXISTS ''@'localhost'", sql)
         self.assertNotIn(b"DROP USER IF EXISTS 'mariadb.sys'", sql)
-        self.assertNotIn(b"DROP USER IF EXISTS 'mysql'", sql)
+        self.assertIn(b"DROP USER IF EXISTS 'mysql'@'localhost'", sql)
+        self.assertIn(b"DROP USER IF EXISTS 'postgres'@'localhost'", sql)
         import_index = next(i for i, (_, k) in enumerate(self.calls) if k.get("input_path"))
         self.assertFalse(any(b"DROP USER" in k.get("input_data", b"") for _, k in self.calls[:import_index]))
 
