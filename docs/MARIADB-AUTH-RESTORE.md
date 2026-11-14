@@ -93,6 +93,52 @@ separate display-format issue, not permission normalization; this harness uses
 the same MariaDB11.8 source/target and retains its raw same-version guard. Actual
 native execution of this update remains NOT RUN in this task.
 
+## Preserve independent global GRANT OPTION
+
+PROXY WITH GRANT OPTION and global Grant_priv are independent source facts.
+Native GRANT PROXY replay can set global Grant_priv=true even when the captured
+source account had only proxy delegation and global Grant_priv=false. Matching
+mysql.proxies_priv alone is therefore not sufficient and never bypasses the
+SHOW GRANTS guard.
+
+Every new login_accounts entry requires its exact global_grant_option boolean:
+
+~~~json
+[{"user":"synthetic","host":"localhost","global_grant_option":false}]
+~~~
+
+Export reads mysql.user.Grant_priv for every source login and verifies the same
+account/flag set again at completion. Strict metadata rejects missing flags,
+null, strings, integers, extra fields and duplicate identities; old snapshots
+without this flag fail closed before starting the helper. False is never
+inferred from missing metadata. No source account is changed by export.
+
+After native globals/data import, seed cleanup and exact PROXY sync, restore
+reads the actual global flags. A required source=true flag absent from the target
+fails without adding privileges. Only source=false / target=true mismatches are
+repaired, with native REVOKE GRANT OPTION ON *.* FROM the exact user@host and a
+privilege flush. It is not REVOKE ALL, a username broadcast or a global/system-table
+copy. Each affected account's db/table/column/routine privilege records are read
+before and after; any narrower-scope change fails rather than accepting lost
+grant options. Grantor/timestamps are excluded from this local semantic comparison.
+
+All source global booleans are then read back and required to match exactly.
+The complete PROXY five-tuple set is rechecked after all revokes, still requiring
+its original with_grant values. No repair loop, implicit grant, quoting
+normalization or disabled SHOW comparison is used. Native denial, scope decrease,
+remaining global mismatch or changed PROXY set leaves an unpublished failed
+private target and stops the helper. The temporary bootstrap is removed only
+after these checks.
+
+The existing native fixture already represents the reported source state: direct
+synthetic PROXY insertion with with_grant=true while the grantee has no global
+Grant_priv. Its full SHOW CREATE USER / SHOW GRANTS guard remains unchanged.
+This patch's new unit tests cover exact-host repair, source-true refusal,
+permission denial, failed readback, routine/schema/table/column scope preservation,
+post-revoke PROXY verification and source-flag drift. Unit mocks are not a native
+execution pass; Lead runs the frozen engine/harness in a separately managed
+isolated synthetic environment. Native status from this agent is NOT RUN.
+
 ## Optional exact-account override (explicit credential migration)
 
 Do not configure this to obtain ordinary preservation. Use it only when a

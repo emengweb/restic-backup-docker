@@ -31,7 +31,7 @@ def pg_info(names=("alpha",)):
 def maria_info(names=("alpha", "beta")):
     return {"engine": "mariadb", "source_major": "11.8", "target_major": "11.8",
             "databases": [{"name": n, "archive": "databases.sql", "character_set": "utf8mb4", "collation": "utf8mb4_unicode_ci"} for n in names],
-            "globals": "globals.sql", "login_accounts": [{"user": "app_owner", "host": "%"}], "proxy_grants": []}
+            "globals": "globals.sql", "login_accounts": [{"user": "app_owner", "host": "%", "global_grant_option": False}], "proxy_grants": []}
 
 
 class EnginesTests(unittest.TestCase):
@@ -115,6 +115,8 @@ class EnginesTests(unittest.TestCase):
                 return Result(0, b"1\n")
             if "COUNT(*)" in sql:
                 return Result(0, b"0\n")
+            if "global_grant_option" in sql and "JSON_ARRAYAGG" in sql:
+                return Result(0, json.dumps(getattr(self, "maria_login_state", maria_info()["login_accounts"])).encode())
             if "JSON_ARRAYAGG" in sql:
                 return Result(0, json.dumps(maria_info()["login_accounts"]).encode())
             if "JSON_OBJECT('name'" in sql:
@@ -124,6 +126,8 @@ class EnginesTests(unittest.TestCase):
         return Result(0)
 
     def payload(self, info):
+        if info.get("engine") == "mariadb":
+            self.maria_login_state = info["login_accounts"]
         for filename in {d["archive"] for d in info["databases"]} | {info["globals"]}:
             (self.stage / filename).write_bytes(b"synthetic-only\n")
 
@@ -388,8 +392,10 @@ class EnginesTests(unittest.TestCase):
 
     def test_maria_default_preserves_same_user_multiple_host_native_globals(self):
         info = maria_info()
-        info["login_accounts"] = [{"user": "app_owner", "host": "localhost"}, {"user": "app_owner", "host": "%"},
-                                   {"user": "socket_user", "host": "localhost"}, {"user": "pam_user", "host": "%"}]
+        info["login_accounts"] = [{"user": "app_owner", "host": "localhost", "global_grant_option": False},
+                                   {"user": "app_owner", "host": "%", "global_grant_option": False},
+                                   {"user": "socket_user", "host": "localhost", "global_grant_option": False},
+                                   {"user": "pam_user", "host": "%", "global_grant_option": False}]
         self.payload(info)
         globals_sql = ("CREATE USER 'app_owner'@'localhost' IDENTIFIED VIA mysql_native_password USING '*SYNTHETIC_ONE';\n"
                        "CREATE USER 'app_owner'@'%' IDENTIFIED VIA mysql_native_password USING '*SYNTHETIC_TWO';\n"
@@ -406,7 +412,8 @@ class EnginesTests(unittest.TestCase):
 
     def test_maria_explicit_override_matches_only_exact_host_and_hash_no_plaintext(self):
         info = maria_info()
-        info["login_accounts"] = [{"user": "app_owner", "host": "localhost"}, {"user": "app_owner", "host": "%"}]
+        info["login_accounts"] = [{"user": "app_owner", "host": "localhost", "global_grant_option": False},
+                                   {"user": "app_owner", "host": "%", "global_grant_option": False}]
         self.maria_mapping([{"user": "app_owner", "host": "localhost", "plugin": "mysql_native_password", "password": "synthetic-specific-host"}])
         def runner(argv, **kwargs):
             result = self.fake_run(argv, **kwargs)
@@ -534,10 +541,110 @@ class EnginesTests(unittest.TestCase):
 
     def test_maria_temporary_bootstrap_cannot_replace_source_account(self):
         info = maria_info()
-        info["login_accounts"].append({"user": "k3s_restore_" + "a" * 16, "host": "localhost"})
+        info["login_accounts"].append({"user": "k3s_restore_" + "a" * 16, "host": "localhost", "global_grant_option": True})
         with patch.object(engines.secrets, "token_hex", return_value="a" * 16):
             self.error("restore_bootstrap_collision", lambda: self.maria_restore(info))
         self.assertFalse(any(argv == ["server-start"] for argv, _ in self.calls))
+
+    def test_maria_global_grant_metadata_missing_and_nonbool_fail_before_server(self):
+        for value in ("missing", None, 0, 1, "N", "false", []):
+            with self.subTest(value=value):
+                info = maria_info()
+                if value == "missing":
+                    del info["login_accounts"][0]["global_grant_option"]
+                    code = "mariadb_global_grant_metadata_required"
+                else:
+                    info["login_accounts"][0]["global_grant_option"] = value
+                    code = "invalid_mariadb_login_metadata"
+                self.error(code, lambda: self.maria_restore(info))
+        self.assertFalse(any(argv == ["server-start"] for argv, _ in self.calls))
+
+    def test_maria_global_grant_repair_is_exact_host_and_preserves_scope(self):
+        accounts = [{"user": "same", "host": "localhost", "global_grant_option": False},
+                    {"user": "same", "host": "%", "global_grant_option": True}]
+        current = [{**item, "global_grant_option": True} for item in accounts]
+        scope = {"db": [{"Grant_priv": "Y"}], "tables_priv": [{"Table_priv": "Select,Grant"}],
+                 "columns_priv": [{"Column_priv": "Select"}], "procs_priv": [{"Proc_priv": "Execute,Alter Routine,Grant"}]}
+        queries = []
+        def query(config, options, sql):
+            queries.append(sql)
+            if "global_grant_option" in sql:
+                return Result(0, json.dumps(current).encode())
+            if sql.startswith("SELECT JSON_OBJECT("):
+                return Result(0, json.dumps(scope).encode())
+            if "REVOKE GRANT OPTION ON *.*" in sql:
+                current[0]["global_grant_option"] = False
+            return Result(0)
+        with patch.object(engines, "_maria_query", side_effect=query):
+            engines._maria_global_grant_sync(self.cfg, "unused", accounts)
+        revoke = [sql for sql in queries if "REVOKE" in sql]
+        self.assertEqual(revoke, ["SET sql_mode=''; REVOKE GRANT OPTION ON *.* FROM 'same'@'localhost'; FLUSH PRIVILEGES;"])
+        self.assertEqual(current, accounts)
+        self.assertNotIn("REVOKE ALL", "\n".join(queries))
+        self.assertEqual(sum(sql.startswith("SELECT JSON_OBJECT(") for sql in queries), 2)
+
+    def test_maria_required_global_grant_option_missing_never_implicitly_granted(self):
+        accounts = [{"user": "same", "host": "%", "global_grant_option": True}]
+        result = Result(0, json.dumps([{**accounts[0], "global_grant_option": False}]).encode())
+        with patch.object(engines, "_maria_query", return_value=result) as query:
+            self.error("mariadb_global_grant_restore_mismatch", lambda: engines._maria_global_grant_sync(self.cfg, "unused", accounts))
+        self.assertFalse(any("GRANT OPTION ON" in call.args[2] for call in query.call_args_list))
+
+    def test_maria_global_revoke_scope_loss_or_native_denial_is_fatal(self):
+        accounts = [{"user": "same", "host": "localhost", "global_grant_option": False}]
+        for cause in ("scope_loss", "denied", "still_true"):
+            with self.subTest(cause=cause):
+                changed = [False]
+                def query(config, options, sql):
+                    if "global_grant_option" in sql:
+                        return Result(0, json.dumps([{**accounts[0], "global_grant_option": not changed[0] or cause == "still_true"}]).encode())
+                    if sql.startswith("SELECT JSON_OBJECT("):
+                        data = {"db": [], "tables_priv": [], "columns_priv": [],
+                                "procs_priv": [{"Proc_priv": "Execute,Grant"}] if not changed[0] or cause != "scope_loss" else []}
+                        return Result(0, json.dumps(data).encode())
+                    if "REVOKE" in sql:
+                        if cause == "denied":
+                            raise BackupError("command_failed", "Synthetic revoke denied")
+                        changed[0] = True
+                    return Result(0)
+                code = {"scope_loss": "mariadb_scoped_grant_restore_mismatch", "denied": "command_failed", "still_true": "mariadb_global_grant_restore_mismatch"}[cause]
+                with patch.object(engines, "_maria_query", side_effect=query):
+                    self.error(code, lambda: engines._maria_global_grant_sync(self.cfg, "unused", accounts))
+
+    def test_maria_proxy_only_grant_option_repairs_global_and_rechecks_proxy(self):
+        info = maria_info()
+        info["proxy_grants"] = [{"user": "app_owner", "host": "%", "proxied_user": "", "proxied_host": "", "with_grant": True}]
+        repaired = [False]
+        def native(argv, **kwargs):
+            result = self.fake_run(argv, **kwargs)
+            sql = kwargs.get("input_data", b"")
+            if b"global_grant_option" in sql:
+                return Result(0, json.dumps([{**info["login_accounts"][0], "global_grant_option": not repaired[0]}]).encode())
+            if sql.startswith(b"SELECT JSON_OBJECT(") and b"mysql.procs_priv" in sql:
+                return Result(0, b'{"db":[],"tables_priv":[],"columns_priv":[],"procs_priv":[]}')
+            if b"REVOKE GRANT OPTION ON *.*" in sql:
+                repaired[0] = True
+            if b"JSON_ARRAYAGG" in sql and b"mysql.proxies_priv" in sql:
+                return Result(0, json.dumps(info["proxy_grants"]).encode())
+            return result
+        self.maria_restore(info, native)
+        self.assertTrue(repaired[0])
+        proxy_queries = [i for i, (_, kw) in enumerate(self.calls) if b"JSON_ARRAYAGG" in kw.get("input_data", b"") and b"mysql.proxies_priv" in kw.get("input_data", b"")]
+        revoke_index = next(i for i, (_, kw) in enumerate(self.calls) if b"REVOKE GRANT OPTION" in kw.get("input_data", b""))
+        self.assertGreater(proxy_queries[-1], revoke_index)
+        self.assertEqual("server-stopped", self.calls[-1][0][0])
+
+    def test_maria_global_grant_export_drift_is_not_accepted(self):
+        self.cfg.engine, self.cfg.databases = "mariadb", ["alpha", "beta"]
+        count = [0]
+        def native(argv, **kwargs):
+            result = self.fake_run(argv, **kwargs)
+            if b"global_grant_option" in kwargs.get("input_data", b""):
+                count[0] += 1
+                return Result(0, json.dumps([{"user": "app_owner", "host": "%", "global_grant_option": count[0] == 2}]).encode())
+            return result
+        with patch.object(engines, "run", native):
+            self.error("mariadb_accounts_changed_during_export", lambda: engines.export_database(self.cfg, self.stage))
 
     def test_maria_proxy_metadata_empty_host_percent_and_host_specific_preserved(self):
         accounts = [{"user": "root", "host": "localhost"}, {"user": "root", "host": "%"}]
@@ -802,11 +909,12 @@ class LegacyAndLifecycleTests(unittest.TestCase):
         self.cfg.engine = "mariadb"
         self.cfg.databases = ["alpha", "beta"]
         info = maria_info()
-        info["login_accounts"].append({"user": "mariadb.sys", "host": "localhost"})
+        info["login_accounts"].append({"user": "mariadb.sys", "host": "localhost", "global_grant_option": False})
         EnginesTests.payload(self, info)
         def with_seed(argv, **kw):
             value = self.fake_run(argv, **kw)
-            if b"JSON_ARRAYAGG" in kw.get("input_data", b"") and b"FROM mysql.user" in kw.get("input_data", b""):
+            if (b"JSON_ARRAYAGG" in kw.get("input_data", b"") and b"FROM mysql.user" in kw.get("input_data", b"")
+                    and b"global_grant_option" not in kw.get("input_data", b"")):
                 return Result(0, json.dumps([{"user": "root", "host": "localhost"}, {"user": "", "host": "localhost"},
                                             {"user": "mariadb.sys", "host": "localhost"}, {"user": "mysql", "host": "localhost"},
                                             {"user": "postgres", "host": "localhost"}]).encode())

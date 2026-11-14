@@ -962,6 +962,82 @@ def _maria_target(config, source):
     return target
 
 
+def _maria_login_query():
+    return ("SELECT COALESCE(JSON_ARRAYAGG(JSON_OBJECT('user',User,'host',Host,"
+            "'global_grant_option',IF(Grant_priv='Y',TRUE,FALSE))),JSON_ARRAY()) FROM mysql.user WHERE is_role='N';")
+
+
+def _maria_login_metadata(value, *, native=False):
+    if not isinstance(value, list) or len(value) > 100000:
+        _fail("invalid_mariadb_login_metadata", "MariaDB login metadata must be an explicit bounded list")
+    result, seen = [], set()
+    for item in value:
+        if not isinstance(item, dict) or set(item) != {"user", "host", "global_grant_option"}:
+            _fail("mariadb_global_grant_metadata_required", "Every MariaDB login requires explicit global grant-option metadata")
+        grant = item["global_grant_option"]
+        if native and type(grant) is int and grant in (0, 1):
+            grant = bool(grant)
+        if type(grant) is not bool:
+            _fail("invalid_mariadb_login_metadata", "MariaDB global grant option must be an explicit boolean")
+        for key in ("user", "host"):
+            if not isinstance(item[key], str) or any(ord(c) < 32 for c in item[key]) or len(item[key]) > 255:
+                _fail("invalid_mariadb_login_metadata", "MariaDB login identity metadata is invalid")
+            try:
+                item[key].encode("utf-8")
+            except UnicodeError:
+                _fail("invalid_mariadb_login_metadata", "MariaDB login identity metadata is invalid")
+        account = (item["user"], item["host"])
+        if account in seen:
+            _fail("invalid_mariadb_login_metadata", "MariaDB login metadata repeats an account")
+        seen.add(account)
+        result.append({"user": account[0], "host": account[1], "global_grant_option": grant})
+    return sorted(result, key=lambda item: (item["user"], item["host"]))
+
+
+def _maria_login_read(config, options):
+    return _maria_login_metadata(_json_output(_maria_query(config, options, _maria_login_query())), native=True)
+
+
+def _maria_scoped_grants(config, options, user, host):
+    # Read only grant-option-bearing scope metadata. No mysql table import and
+    # no user data: this guards REVOKE's effects on narrower privileges.
+    where = "BINARY User=" + _maria_literal(user) + " AND BINARY Host=" + _maria_literal(host)
+    tables = {"db": ("Host", "Db", "User", "Grant_priv"),
+              "tables_priv": ("Host", "Db", "User", "Table_name", "Table_priv", "Column_priv"),
+              "columns_priv": ("Host", "Db", "User", "Table_name", "Column_name", "Column_priv"),
+              "procs_priv": ("Host", "Db", "User", "Routine_name", "Routine_type", "Proc_priv")}
+    fields = []
+    for table, columns in tables.items():
+        record = ",".join("'" + name + "'," + name for name in columns)
+        fields.append("'" + table + "',(SELECT COALESCE(JSON_ARRAYAGG(JSON_OBJECT(" + record
+                      + ")),JSON_ARRAY()) FROM mysql." + table + " WHERE " + where + ")")
+    data = _json_output(_maria_query(config, options, "SELECT JSON_OBJECT(" + ",".join(fields) + ");"))
+    if not isinstance(data, dict) or set(data) != set(tables) or any(not isinstance(rows, list) for rows in data.values()):
+        _fail("invalid_mariadb_scoped_grants", "MariaDB scoped grant metadata could not be verified")
+    return {table: sorted(json.dumps(row, sort_keys=True, ensure_ascii=True) for row in rows)
+            for table, rows in data.items()}
+
+
+def _maria_global_grant_sync(config, options, accounts):
+    current = {(item["user"], item["host"]): item["global_grant_option"] for item in _maria_login_read(config, options)}
+    repairs = []
+    for account in accounts:
+        key = (account["user"], account["host"])
+        if key not in current or (account["global_grant_option"] and not current[key]):
+            _fail("mariadb_global_grant_restore_mismatch", "A required MariaDB global grant option is absent; no implicit privilege grant is allowed")
+        if not account["global_grant_option"] and current[key]:
+            repairs.append(key)
+    for user, host in repairs:
+        before = _maria_scoped_grants(config, options, user, host)
+        _maria_query(config, options, "SET sql_mode=''; REVOKE GRANT OPTION ON *.* FROM "
+                     + _maria_account(user, host) + "; FLUSH PRIVILEGES;")
+        if _maria_scoped_grants(config, options, user, host) != before:
+            _fail("mariadb_scoped_grant_restore_mismatch", "Removing an extra global grant option changed narrower MariaDB grants")
+    final = {(item["user"], item["host"]): item["global_grant_option"] for item in _maria_login_read(config, options)}
+    if any(final.get((item["user"], item["host"])) is not item["global_grant_option"] for item in accounts):
+        _fail("mariadb_global_grant_restore_mismatch", "Restored MariaDB global grant options differ from snapshot metadata")
+
+
 def _maria_proxy_query():
     return ("SELECT COALESCE(JSON_ARRAYAGG(JSON_OBJECT('user',User,'host',Host,"
             "'proxied_user',Proxied_user,'proxied_host',Proxied_host,"
@@ -1067,9 +1143,7 @@ def _export_mariadb(config, stage):
                 _fail("invalid_database_metadata", "A declared MariaDB database is unavailable")
             value["archive"] = "databases.sql"
             entries.append(value)
-        users = _json_output(_maria_query(config, options, "SELECT COALESCE(JSON_ARRAYAGG(JSON_OBJECT('user',User,'host',Host)),JSON_ARRAY()) FROM mysql.user WHERE is_role='N';"))
-        if not isinstance(users, list) or any(not isinstance(u, dict) or not isinstance(u.get("user"), str) or not isinstance(u.get("host"), str) for u in users):
-            _fail("invalid_database_metadata", "MariaDB account metadata is invalid")
+        users = _maria_login_read(config, options)
         proxy_grants = _maria_proxy_read(config, options, users)
         # --replace globals preserves grant/account attributes, including auth hashes.
         _call(config, [_maria_bin(config, "dump"), "--defaults-file=" + str(options), "--system=users", "--replace",
@@ -1080,6 +1154,8 @@ def _export_mariadb(config, stage):
         _archive(stage, "globals.sql")
         _archive(stage, "databases.sql")
         _maria_innodb(config, options, names)
+        if _maria_login_read(config, options) != users:
+            _fail("mariadb_accounts_changed_during_export", "MariaDB accounts or global grant options changed during export; quiesce account changes")
         if _maria_proxy_read(config, options, users) != proxy_grants:
             _fail("mariadb_proxy_changed_during_export", "MariaDB PROXY permissions changed during export; quiesce account changes")
     return {"engine": "mariadb", "source_major": source, "target_major": target, "databases": entries,
@@ -1161,9 +1237,7 @@ def _restore_mariadb(config, stage, target, info):
     if len(archives) != 1:
         _fail("invalid_database_metadata", "MariaDB requires a single all-database transactional archive")
     globals_file = _archive(stage, info.get("globals"))
-    accounts = info.get("login_accounts")
-    if not isinstance(accounts, list) or any(not isinstance(a, dict) or not isinstance(a.get("user"), str) or not isinstance(a.get("host"), str) for a in accounts):
-        _fail("invalid_database_metadata", "MariaDB login account metadata is invalid")
+    accounts = _maria_login_metadata(info.get("login_accounts"))
     source_accounts = {(a["user"], a["host"]) for a in accounts}
     if len(source_accounts) != len(accounts):
         _fail("invalid_database_metadata", "MariaDB login account metadata contains duplicate identities")
@@ -1222,6 +1296,9 @@ def _restore_mariadb(config, stage, target, info):
                 _maria_auth_override(config, options, overrides)
                 _maria_verify_logins(config, options, accounts, bootstrap)
                 _maria_proxy_sync(config, options, proxy_grants, accounts, bootstrap)
+                _maria_global_grant_sync(config, options, accounts)
+                if _maria_proxy_read(config, options, accounts) != proxy_grants:
+                    _fail("mariadb_proxy_restore_mismatch", "Global grant-option reconciliation changed MariaDB PROXY permissions")
                 _maria_query(config, options, "SET sql_mode=''; DROP USER " + _maria_account(bootstrap, "localhost") + "; FLUSH TABLES;")
         _fsync_tree(target)
 
