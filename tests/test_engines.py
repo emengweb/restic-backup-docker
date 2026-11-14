@@ -350,7 +350,7 @@ class EnginesTests(unittest.TestCase):
             self.assertFalse(path.exists())
         self.assertFalse(runtime.exists())
 
-    def test_maria_restore_streams_archives_and_injects_only_hash(self):
+    def test_maria_restore_streams_archives_without_connection_password_rewrite(self):
         self.cfg.engine = "mariadb"
         self.cfg.databases = ["alpha", "beta"]
         info = maria_info()
@@ -361,9 +361,179 @@ class EnginesTests(unittest.TestCase):
         self.assertEqual(["globals.sql", "databases.sql"], streams)
         sql = b"\n".join(k.get("input_data", b"") for _, k in self.calls)
         self.assertNotIn(self.cfg.db_password.encode(), sql)
-        self.assertIn(engines._maria_hash(self.cfg.db_password).encode(), sql)
+        self.assertNotIn(engines._maria_hash(self.cfg.db_password).encode(), sql)
+        self.assertNotIn(b"ALTER USER", sql)
         self.assertIn(b"DROP USER", sql)
         self.assertEqual("server-stopped", self.calls[-1][0][0])
+
+    def maria_restore(self, info=None, runner=None):
+        self.cfg.engine = "mariadb"
+        self.cfg.databases = ["alpha", "beta"]
+        info = maria_info() if info is None else info
+        if not (self.stage / info["globals"]).exists():
+            self.payload(info)
+        with patch.object(engines, "run", runner or self.fake_run), patch.object(engines, "_database_access", self.access), patch.object(engines, "_maria_server", self.server):
+            engines.restore_database(self.cfg, self.stage, self.target, {"engine": info})
+
+    def maria_mapping(self, records, *, mode=0o600):
+        path = self.root / "synthetic-maria-map.json"
+        path.write_text(json.dumps({"schema_version": 1, "accounts": records}))
+        path.chmod(mode)
+        self.cfg.env["RESTORE_MARIADB_ACCOUNT_PASSWORDS_FILE"] = str(path)
+        return path
+
+    def test_maria_default_preserves_same_user_multiple_host_native_globals(self):
+        info = maria_info()
+        info["login_accounts"] = [{"user": "app_owner", "host": "localhost"}, {"user": "app_owner", "host": "%"},
+                                   {"user": "socket_user", "host": "localhost"}, {"user": "pam_user", "host": "%"}]
+        self.payload(info)
+        globals_sql = ("CREATE USER 'app_owner'@'localhost' IDENTIFIED VIA mysql_native_password USING '*SYNTHETIC_ONE';\n"
+                       "CREATE USER 'app_owner'@'%' IDENTIFIED VIA mysql_native_password USING '*SYNTHETIC_TWO';\n"
+                       "CREATE USER 'socket_user'@'localhost' IDENTIFIED VIA unix_socket;\n"
+                       "CREATE USER 'pam_user'@'%' IDENTIFIED VIA pam USING 'synthetic-policy';\n"
+                       "GRANT SELECT ON alpha.* TO 'app_owner'@'localhost';\n")
+        (self.stage / "globals.sql").write_text(globals_sql)
+        self.maria_restore(info)
+        self.assertEqual((self.stage / "globals.sql").read_text(), globals_sql)
+        sql = b"\n".join(k.get("input_data", b"") for _, k in self.calls)
+        self.assertNotIn(b"ALTER USER", sql)
+        self.assertNotIn(engines._maria_hash(self.cfg.db_password).encode(), sql)
+        self.assertEqual([k["input_path"] for _, k in self.calls if k.get("input_path")][0], self.stage / "globals.sql")
+
+    def test_maria_explicit_override_matches_only_exact_host_and_hash_no_plaintext(self):
+        info = maria_info()
+        info["login_accounts"] = [{"user": "app_owner", "host": "localhost"}, {"user": "app_owner", "host": "%"}]
+        self.maria_mapping([{"user": "app_owner", "host": "localhost", "plugin": "mysql_native_password", "password": "synthetic-specific-host"}])
+        def runner(argv, **kwargs):
+            result = self.fake_run(argv, **kwargs)
+            if b"SELECT COUNT(*) FROM mysql.user WHERE BINARY" in kwargs.get("input_data", b""):
+                return Result(0, b"1\n")
+            return result
+        self.maria_restore(info, runner)
+        sql = b"\n".join(k.get("input_data", b"") for _, k in self.calls)
+        self.assertIn(b"ALTER USER 'app_owner'@'localhost'", sql)
+        self.assertNotIn(b"ALTER USER 'app_owner'@'%'", sql)
+        self.assertIn(engines._maria_hash("synthetic-specific-host").encode(), sql)
+        self.assertNotIn(b"synthetic-specific-host", sql)
+        self.assertNotIn(engines._maria_hash(self.cfg.db_password).encode(), sql)
+        self.assertEqual("server-stopped", self.calls[-1][0][0])
+
+    def test_maria_refuses_role_only_mapping_without_reading_it(self):
+        self.cfg.env["RESTORE_ROLE_PASSWORDS_FILE"] = "/synthetic-path-not-read"
+        self.error("ambiguous_mariadb_password_mapping", self.maria_restore)
+        self.assertFalse(any(argv == ["server-start"] for argv, _ in self.calls))
+
+    def test_maria_mapping_private_file_modes_symlink_hardlink_and_owner(self):
+        entries = [{"user": "app_owner", "host": "%", "plugin": "mysql_native_password", "password": "synthetic-other"}]
+        for mode in (0o644, 0o640, 0o400, 0o700):
+            with self.subTest(mode=mode):
+                self.maria_mapping(entries, mode=mode)
+                self.error("unsafe_mariadb_password_file", lambda: engines._maria_account_passwords(self.cfg))
+        path = self.maria_mapping(entries)
+        alias = self.root / "mapping-link"
+        alias.symlink_to(path)
+        self.cfg.env["RESTORE_MARIADB_ACCOUNT_PASSWORDS_FILE"] = str(alias)
+        self.error("invalid_mariadb_password_file", lambda: engines._maria_account_passwords(self.cfg))
+        alias.unlink()
+        os.link(path, alias)
+        self.cfg.env["RESTORE_MARIADB_ACCOUNT_PASSWORDS_FILE"] = str(path)
+        self.error("unsafe_mariadb_password_file", lambda: engines._maria_account_passwords(self.cfg))
+        alias.unlink()
+        if os.geteuid() == 0:
+            os.chown(path, 65534, 65534)
+            self.error("unsafe_mariadb_password_file", lambda: engines._maria_account_passwords(self.cfg))
+
+    def test_maria_mapping_invalid_missing_host_duplicate_identity_and_json(self):
+        valid = {"user": "app_owner", "host": "%", "plugin": "mysql_native_password", "password": "synthetic-other"}
+        for entries in ([{key: value for key, value in valid.items() if key != "host"}], [valid, valid],
+                        [{**valid, "password": ""}], [{**valid, "host": ""}], [{**valid, "user": "bad\0user"}],
+                        [{**valid, "password": "bad\0password"}], [{**valid, "user": "\ud800"}], [{**valid, "password": "\ud800"}]):
+            with self.subTest(entries=entries):
+                self.maria_mapping(entries)
+                self.error("invalid_mariadb_password_file", lambda: engines._maria_account_passwords(self.cfg))
+        path = self.maria_mapping([valid])
+        for raw in ("{", "[]", '{"schema_version":1,"schema_version":1,"accounts":[]}'):
+            path.write_text(raw)
+            self.error("invalid_mariadb_password_file", lambda: engines._maria_account_passwords(self.cfg))
+        self.maria_mapping([{**valid, "plugin": "pam"}])
+        self.error("unsupported_mariadb_auth_override", lambda: engines._maria_account_passwords(self.cfg))
+
+    def test_maria_absent_host_override_refused_before_server_start(self):
+        self.maria_mapping([{"user": "app_owner", "host": "localhost", "plugin": "mysql_native_password", "password": "synthetic-other"}])
+        self.error("unknown_restore_account", self.maria_restore)
+        self.assertFalse(any(argv == ["server-start"] for argv, _ in self.calls))
+
+    def test_maria_actual_imported_account_missing_and_permission_errors_are_fatal(self):
+        self.maria_mapping([{"user": "app_owner", "host": "%", "plugin": "mysql_native_password", "password": "synthetic-other"}])
+        self.error("unknown_restore_account", self.maria_restore)
+        self.assertEqual("server-stopped", self.calls[-1][0][0])
+        def denied(argv, **kwargs):
+            if b"SELECT COUNT(*) FROM mysql.user WHERE BINARY" in kwargs.get("input_data", b""):
+                raise BackupError("command_failed", "Synthetic account query denied")
+            return self.fake_run(argv, **kwargs)
+        self.error("command_failed", lambda: self.maria_restore(runner=denied))
+        self.assertEqual("server-stopped", self.calls[-1][0][0])
+
+    def test_maria_override_verification_failure_does_not_succeed(self):
+        self.maria_mapping([{"user": "app_owner", "host": "%", "plugin": "mysql_native_password", "password": "synthetic-other"}])
+        def mismatch(argv, **kwargs):
+            result = self.fake_run(argv, **kwargs)
+            sql = kwargs.get("input_data", b"")
+            if b"SELECT COUNT(*) FROM mysql.user WHERE BINARY" in sql:
+                return Result(0, b"0\n" if b"authentication_string" in sql else b"1\n")
+            return result
+        self.error("mariadb_auth_override_mismatch", lambda: self.maria_restore(runner=mismatch))
+        self.assertEqual("server-stopped", self.calls[-1][0][0])
+
+    def test_maria_connection_password_is_not_an_override_even_if_user_is_absent(self):
+        self.cfg.db_user = "connection_only"
+        self.maria_restore()
+        sql = b"\n".join(k.get("input_data", b"") for _, k in self.calls)
+        self.assertNotIn(b"ALTER USER", sql)
+        self.assertNotIn(engines._maria_hash(self.cfg.db_password).encode(), sql)
+
+    def test_maria_explicit_percent_host_is_literal_account_not_host_broadcast(self):
+        self.maria_mapping([{"user": "app_owner", "host": "%", "plugin": "mysql_native_password", "password": "synthetic-percent-only"}])
+        def runner(argv, **kwargs):
+            result = self.fake_run(argv, **kwargs)
+            if b"SELECT COUNT(*) FROM mysql.user WHERE BINARY" in kwargs.get("input_data", b""):
+                return Result(0, b"1\n")
+            return result
+        self.maria_restore(runner=runner)
+        sql = b"\n".join(k.get("input_data", b"") for _, k in self.calls)
+        self.assertIn(b"ALTER USER 'app_owner'@'%'", sql)
+        self.assertNotIn(b" LIKE ", sql)
+
+    def test_maria_mapping_read_failure_and_fifo_are_rejected_without_blocking(self):
+        self.cfg.env["RESTORE_MARIADB_ACCOUNT_PASSWORDS_FILE"] = str(self.root / "missing")
+        self.error("invalid_mariadb_password_file", lambda: engines._maria_account_passwords(self.cfg))
+        fifo = self.root / "mapping-fifo"
+        os.mkfifo(fifo, 0o600)
+        self.cfg.env["RESTORE_MARIADB_ACCOUNT_PASSWORDS_FILE"] = str(fifo)
+        self.error("unsafe_mariadb_password_file", lambda: engines._maria_account_passwords(self.cfg))
+        self.cfg.env["RESTORE_MARIADB_ACCOUNT_PASSWORDS_FILE"] = str(self.root / "denied")
+        with patch.object(engines.os, "open", side_effect=PermissionError()):
+            self.error("invalid_mariadb_password_file", lambda: engines._maria_account_passwords(self.cfg))
+
+    def test_maria_explicit_alter_permission_failure_stops_without_success(self):
+        self.maria_mapping([{"user": "app_owner", "host": "%", "plugin": "mysql_native_password", "password": "synthetic-other"}])
+        def denied(argv, **kwargs):
+            result = self.fake_run(argv, **kwargs)
+            sql = kwargs.get("input_data", b"")
+            if b"SELECT COUNT(*) FROM mysql.user WHERE BINARY" in sql:
+                return Result(0, b"1\n")
+            if b"ALTER USER" in sql:
+                raise BackupError("command_failed", "Synthetic account update denied")
+            return result
+        self.error("command_failed", lambda: self.maria_restore(runner=denied))
+        self.assertEqual("server-stopped", self.calls[-1][0][0])
+
+    def test_maria_temporary_bootstrap_cannot_replace_source_account(self):
+        info = maria_info()
+        info["login_accounts"].append({"user": "k3s_restore_" + "a" * 16, "host": "localhost"})
+        with patch.object(engines.secrets, "token_hex", return_value="a" * 16):
+            self.error("restore_bootstrap_collision", lambda: self.maria_restore(info))
+        self.assertFalse(any(argv == ["server-start"] for argv, _ in self.calls))
 
     def test_maria_restore_failure_stops_and_keeps_input(self):
         self.cfg.engine = "mariadb"

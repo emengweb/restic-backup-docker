@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import pwd
 import re
 import shutil
 import signal
@@ -21,6 +22,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 import uuid
 
 
@@ -321,22 +323,48 @@ def postgres_e2e(major, *, physical=False, old_vector=False, dual=False, final_u
     print("PASS " + case + ": " + ("native logical+physical dual stream" if dual else "pg_basebackup+pg_verifybackup+WAL replay" if physical else "native archives+globals/roles") + ", two DBs, vector/JSONB/bytea/FK/index/sequence/locale, published restart, clean shutdown")
 
 
+def maria_owner_command(argv, uid=998, gid=998):
+    require(type(uid) is int and type(gid) is int and 0 < uid < 2**32 - 1 and 0 < gid < 2**32 - 1,
+            "mariadb_fixture_invalid_numeric_identity")
+    if (uid, gid) == (998, 998):
+        return db_command("mysql", argv)
+    return ["/usr/bin/setpriv", "--reuid=" + str(uid), "--regid=" + str(gid),
+            "--clear-groups", "--", *[str(item) for item in argv]]
+
+
+def maria_runtime(root, name, uid, gid):
+    path = root / name
+    path.mkdir(mode=0o700)
+    os.chown(path, uid, gid)
+    return path
+
+
+def maria_published_owner(target, uid, gid):
+    require((target.stat().st_uid, target.stat().st_gid) == (uid, gid), "mariadb_published_root_identity")
+    for path in target.rglob("*"):
+        info = path.lstat()
+        if path.parent == target and path.name == ".k3s-restic-restore.json":
+            require(info.st_uid == 0 and stat.S_IMODE(info.st_mode) == 0o600, "mariadb_restore_journal_owner")
+            continue
+        require((info.st_uid, info.st_gid) == (uid, gid), "mariadb_published_tree_identity")
+
+
 @contextmanager
-def maria_server(data, socket_path, root, *, initialize=False, password=""):
+def maria_server(data, socket_path, root, *, initialize=False, password="", uid=998, gid=998):
     if initialize:
         data.mkdir(mode=0o700)
-        os.chown(data, 998, 998)
-        command(db_command("mysql", ["mariadb-install-db", "--no-defaults", "--datadir=" + str(data),
+        os.chown(data, uid, gid)
+        command(maria_owner_command(["mariadb-install-db", "--no-defaults", "--datadir=" + str(data),
                                      "--auth-root-authentication-method=normal", "--skip-test-db",
-                                     "--innodb-log-file-size=8M"]))
+                                     "--innodb-log-file-size=8M"], uid, gid))
     logfile = root / "mariadb-native.log"
     stream = logfile.open("ab")
     proc = None
     try:
-        argv = db_command("mysql", ["mariadbd", "--no-defaults", "--datadir=" + str(data),
+        argv = maria_owner_command(["mariadbd", "--no-defaults", "--datadir=" + str(data),
                    "--socket=" + str(socket_path), "--pid-file=" + str(root / "maria.pid"),
                    "--tmpdir=" + str(root), "--skip-networking", "--skip-log-bin", "--skip-name-resolve",
-                   "--innodb-buffer-pool-size=32M", "--innodb-log-file-size=8M", "--innodb-use-native-aio=0"])
+                   "--innodb-buffer-pool-size=32M", "--innodb-log-file-size=8M", "--innodb-use-native-aio=0"], uid, gid)
         proc = subprocess.Popen(argv, env=clean_env(), stdin=subprocess.DEVNULL, stdout=stream,
                                 stderr=stream, start_new_session=True)
         deadline = time.monotonic() + 60
@@ -378,15 +406,35 @@ def maria_sql(socket_path, sql, password, ok=True):
                    env=dict(clean_env(), MYSQL_PWD=password), data=sql.encode(), ok=ok)
 
 
-def mariadb_e2e():
+def maria_auth_state(socket_path, password):
+    """Keep synthetic auth/grants only in memory; never print verifiers or SQL."""
+    from k3s_backup.engines import _maria_account
+    raw = maria_sql(socket_path, "SELECT COALESCE(JSON_ARRAYAGG(JSON_OBJECT('user',User,'host',Host)),JSON_ARRAY()) FROM mysql.user WHERE is_role='N';", password).stdout
+    accounts = json.loads(raw)
+    state = {}
+    for account in accounts:
+        user, host = account["user"], account["host"]
+        literal = _maria_account(user, host)
+        account_sql = maria_sql(socket_path, "SET sql_mode=''; SHOW CREATE USER " + literal + ";", password).stdout
+        grants = maria_sql(socket_path, "SET sql_mode=''; SHOW GRANTS FOR " + literal + ";", password).stdout.splitlines()
+        state[(user, host)] = {"authentication": account_sql, "grants": tuple(sorted(grants))}
+    return state
+
+
+def mariadb_e2e(final_uid=998):
     password = "synthetic-database-only"
-    with case_paths("mariadb") as (root, work, target, repo):
-        os.chown(root, 998, 998)
-        source, source_socket = root / "source", root / "source.sock"
-        env = base_env(work, target, repo, "mariadb")
+    case = "mariadb" if final_uid == 998 else "maria-final-uid" + str(final_uid)
+    if final_uid == 999:
+        require(pwd.getpwuid(999).pw_name == "postgres", "mariadb_uid999_nss_fixture_changed")
+    with case_paths(case) as (root, work, target, repo):
+        # Traverse only: private socket/tmp directories have their own DB UID.
+        root.chmod(0o711)
+        source_runtime = maria_runtime(root, "source-runtime", 998, 998)
+        source, source_socket = root / "source", source_runtime / "server.sock"
+        env = base_env(work, target, repo, case)
         env.update(DATABASE_TYPE="mariadb", DATABASE_HOST=str(source_socket), MARIADB_SOCKET=str(source_socket),
                    DATABASE_USER="root", DATABASE_PASSWORD=password, DATABASE_NAME="fixture_a,fixture_b",
-                   DATABASE_MAJOR="11.8", DB_UID="998", DB_GID="998")
+                   DATABASE_MAJOR="11.8", DB_UID=str(final_uid), DB_GID=str(final_uid))
         baseline = {}
         def query(database):
             return ("SELECT id,JSON_COMPACT(body),HEX(bytes),note FROM " + database + ".items ORDER BY id;"
@@ -394,8 +442,13 @@ def mariadb_e2e():
                     "SELECT COUNT(*) FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA='" + database + "';"
                     "SELECT COUNT(*) FROM information_schema.EVENTS WHERE EVENT_SCHEMA='" + database + "';"
                     "SELECT COUNT(*) FROM mysql.user WHERE User='fixture_reader';")
-        with maria_server(source, source_socket, root, initialize=True, password=password):
-            maria_sql(source_socket, "CREATE USER 'fixture_reader'@'localhost';", password)
+        with maria_server(source, source_socket, source_runtime, initialize=True, password=password):
+            from k3s_backup.engines import _maria_hash
+            maria_sql(source_socket, "CREATE USER 'fixture_reader'@'localhost';"
+                      "CREATE USER 'fixture_multi'@'localhost' IDENTIFIED VIA mysql_native_password USING '" + _maria_hash("synthetic-local-only") + "';"
+                      "CREATE USER 'fixture_multi'@'%' IDENTIFIED VIA mysql_native_password USING '" + _maria_hash("synthetic-remote-only") + "';"
+                      "CREATE USER 'root'@'%' IDENTIFIED VIA mysql_native_password USING '" + _maria_hash("synthetic-distinct-root-remote") + "';"
+                      "CREATE USER 'fixture_socket'@'localhost' IDENTIFIED VIA unix_socket;", password)
             for database in ("fixture_a", "fixture_b"):
                 maria_sql(source_socket, "CREATE DATABASE " + database + " CHARACTER SET utf8mb4 COLLATE utf8mb4_bin;"
                    "CREATE TABLE " + database + ".items(id bigint AUTO_INCREMENT PRIMARY KEY,body JSON,bytes BLOB,note VARCHAR(20)) ENGINE=InnoDB;"
@@ -406,7 +459,9 @@ def mariadb_e2e():
                    "CREATE VIEW " + database + ".summary AS SELECT id,body FROM " + database + ".items;"
                    "CREATE PROCEDURE " + database + ".fixture_count() SELECT COUNT(*) FROM " + database + ".items;"
                    "CREATE EVENT " + database + ".fixture_event ON SCHEDULE EVERY 1 DAY DISABLE DO SELECT 1;"
-                   "GRANT SELECT ON " + database + ".* TO 'fixture_reader'@'localhost';", password)
+                   "GRANT SELECT ON " + database + ".* TO 'fixture_reader'@'localhost';"
+                   "GRANT SELECT ON " + database + ".* TO 'fixture_multi'@'localhost';"
+                   "GRANT SELECT,INSERT ON " + database + ".* TO 'fixture_multi'@'%';", password)
                 baseline[database] = maria_sql(source_socket, query(database), password).stdout
             if env.get("E2E_SAFE_TRACE") == "1":
                 accounts = json.loads(maria_sql(source_socket, "SELECT JSON_ARRAYAGG(JSON_OBJECT('user',User,'host',Host,'role',is_role)) FROM mysql.user;", password).stdout)
@@ -417,19 +472,62 @@ def mariadb_e2e():
                         if test.returncode:
                             known = account["user"] if account["user"] in {"root", "mysql", "mariadb.sys", "mysql.sys", "PUBLIC", "fixture_reader", ""} else "other"
                             print("DIAG account_ordinal=" + str(ordinal) + "_known=" + known + "_role=" + account["role"] + "_op=" + operation.split()[1] + "_rc=" + str(test.returncode), flush=True)
+            auth_baseline = maria_auth_state(source_socket, password)
+            local_grants_query = "SELECT * FROM mysql.db WHERE User='fixture_multi' AND Host='localhost' ORDER BY Db;"
+            local_grants = maria_sql(source_socket, local_grants_query, password).stdout
+            require(auth_baseline[("fixture_multi", "localhost")]["authentication"] != auth_baseline[("fixture_multi", "%")]["authentication"], "mariadb_fixture_host_auth_not_distinct")
             init_repo(env)
             require(cli(env, "backup").get("status") == "backed_up", "mariadb_backup_failed")
             reject_failed_export(env)
         require(cli(dict(env, HOSTNAME="synthetic-recreated-pod"), "restore-init").get("status") == "restored",
                 "mariadb_restore_not_completed")
-        require(target.stat().st_uid == 998, "mariadb_published_root_uid")
-        with maria_server(target, root / "restored.sock", root, password=password):
+        maria_published_owner(target, final_uid, final_uid)
+        restored_runtime = maria_runtime(root, "restored-runtime", final_uid, final_uid)
+        restored_socket = restored_runtime / "server.sock"
+        with maria_server(target, restored_socket, restored_runtime, password=password, uid=final_uid, gid=final_uid):
+            require(maria_auth_state(restored_socket, password) == auth_baseline, "mariadb_default_auth_or_grants_changed")
             for database in ("fixture_a", "fixture_b"):
-                actual = maria_sql(root / "restored.sock", query(database), password).stdout
+                actual = maria_sql(restored_socket, query(database), password).stdout
                 require(actual == baseline[database], "mariadb_restored_invariants_mismatch")
-                maria_sql(root / "restored.sock", "INSERT INTO " + database + ".items(body,note) VALUES('{}','third');", password)
+                maria_sql(restored_socket, "INSERT INTO " + database + ".items(body,note) VALUES('{}','third');", password)
+        # Restore the SAME uploaded snapshot into a second empty target with one
+        # explicit account override. Source/restored verifier bytes never print.
+        override_target = target.parent / (target.name + "-auth-override")
+        require(not override_target.exists(), "mariadb_override_target_already_exists")
+        override_target.mkdir(mode=0o700)
+        try:
+            mapping = root / "synthetic-account-overrides.json"
+            mapping.write_text(json.dumps({"schema_version": 1, "accounts": [
+                {"user": "fixture_multi", "host": "localhost", "plugin": "mysql_native_password",
+                 "password": "synthetic-explicit-local-only"}]}))
+            mapping.chmod(0o600)
+            override_env = dict(env, DATA_PATH=str(override_target), HOSTNAME="synthetic-override-pod",
+                                RESTORE_MARIADB_ACCOUNT_PASSWORDS_FILE=str(mapping))
+            require(cli(override_env, "restore-init").get("status") == "restored", "mariadb_explicit_override_restore_failed")
+            maria_published_owner(override_target, final_uid, final_uid)
+            override_runtime = maria_runtime(root, "override-runtime", final_uid, final_uid)
+            override_socket = override_runtime / "server.sock"
+            with maria_server(override_target, override_socket, override_runtime, password=password, uid=final_uid, gid=final_uid):
+                changed = maria_auth_state(override_socket, password)
+                key = ("fixture_multi", "localhost")
+                require(set(changed) == set(auth_baseline), "mariadb_override_changed_account_set")
+                for account in changed:
+                    if account == key:
+                        require(changed[account]["authentication"] != auth_baseline[account]["authentication"], "mariadb_requested_override_not_changed")
+                    else:
+                        require(changed[account] == auth_baseline[account], "mariadb_override_changed_unmapped_account")
+                # SHOW GRANTS can include the intentionally changed verifier;
+                # the fixture's per-schema grants must still be identical.
+                require(maria_sql(override_socket, local_grants_query, password).stdout == local_grants, "mariadb_override_changed_schema_grants")
+                actual_hash = maria_sql(override_socket, "SELECT authentication_string FROM mysql.user WHERE User='fixture_multi' AND Host='localhost';", password).stdout.strip()
+                require(actual_hash == _maria_hash("synthetic-explicit-local-only").encode(), "mariadb_override_verifier_mismatch")
+        finally:
+            if override_target.is_dir() and not override_target.is_symlink():
+                shutil.rmtree(override_target)
         check_repo(env)
-    print("PASS mariadb11.8: native dumps, globals/grants, two InnoDB DBs, JSON/blob/FK/view/trigger/routine/event, published restart, clean shutdown")
+        if final_uid == 999:
+            require(pwd.getpwuid(999).pw_name == "postgres", "mariadb_uid999_nss_mapping_modified")
+    print("PASS " + case + ": source uid998, restored uid" + str(final_uid) + ", preserved per-host auth/plugins/grants, explicit single-host override, native dumps, published restart, clean shutdown")
 
 
 def container_args(image, name, runtime, case):
@@ -459,7 +557,8 @@ def inside(case):
     command(["image-selftest"])
     cases = {"files": files_e2e, "pg16": lambda: postgres_e2e(16),
              "pg17": lambda: postgres_e2e(17), "pg17-uid70": lambda: postgres_e2e(17, final_uid=70), "pg17-vector082": lambda: postgres_e2e(17, old_vector=True),
-             "pg17-physical": lambda: postgres_e2e(17, physical=True), "pg17-dual": lambda: postgres_e2e(17, dual=True), "mariadb": mariadb_e2e}
+             "pg17-physical": lambda: postgres_e2e(17, physical=True), "pg17-dual": lambda: postgres_e2e(17, dual=True), "mariadb": mariadb_e2e,
+             "maria-final-uid999": lambda: mariadb_e2e(final_uid=999)}
     for name in cases if case == "all" else [case]:
         cases[name]()
     print("PASS requested synthetic container E2E; no production compatibility claim")
@@ -476,6 +575,71 @@ class HarnessTests(unittest.TestCase):
     def test_does_not_forward_host_credentials(self):
         self.assertFalse(any(k.startswith(("AWS", "RESTIC", "DATABASE", "KUBE")) for k in clean_env()))
 
+    def test_maria_uid999_uses_numeric_identity_not_packaged_mysql(self):
+        argv = maria_owner_command(["mariadbd", "--no-defaults"], 999, 999)
+        self.assertEqual(argv, ["/usr/bin/setpriv", "--reuid=999", "--regid=999", "--clear-groups", "--", "mariadbd", "--no-defaults"])
+        self.assertNotIn("mysql", argv)
+        self.assertNotIn("postgres", argv)
+        self.assertEqual(maria_owner_command(["mariadbd"]), db_command("mysql", ["mariadbd"]))
+        for uid in (0, -1, True, "999", 2**32 - 1):
+            with self.subTest(uid=uid), self.assertRaises(E2EFailure):
+                maria_owner_command(["mariadbd"], uid, 999)
+
+    def test_maria_uid999_install_and_restart_commands_agree_without_native_execution(self):
+        with tempfile.TemporaryDirectory(prefix="synthetic-maria-uid-unit-") as directory:
+            root = Path(directory)
+            data, socket_path = root / "data", root / "server.sock"
+            socket_path.touch()
+            proc = mock.Mock()
+            proc.poll.return_value = None
+            proc.returncode = 0
+            proc.wait.return_value = 0
+            native = sys.modules[__name__]
+            with mock.patch.object(native, "command", return_value=subprocess.CompletedProcess([], 0, b"", b"")) as called:
+                with mock.patch.object(native, "maria_sql", return_value=subprocess.CompletedProcess([], 0, b"1", b"")):
+                    with mock.patch.object(subprocess, "Popen", return_value=proc) as start:
+                        with mock.patch.object(os, "chown") as owner:
+                            with maria_server(data, socket_path, root, initialize=True, uid=999, gid=999):
+                                pass
+            owner.assert_called_once_with(data, 999, 999)
+            install = called.call_args_list[0].args[0]
+            server = start.call_args.args[0]
+            for argv in (install, server):
+                self.assertEqual(argv[:5], ["/usr/bin/setpriv", "--reuid=999", "--regid=999", "--clear-groups", "--"])
+            self.assertIn("mariadb-install-db", install)
+            self.assertIn("mariadbd", server)
+            self.assertIn("--skip-networking", server)
+            self.assertIn("--auth-root-authentication-method=normal", install)
+            proc.wait.assert_called_once_with(timeout=30)
+
+    def test_maria_published_owner_checks_tree_and_exempts_private_journal(self):
+        with tempfile.TemporaryDirectory(prefix="synthetic-maria-owner-unit-") as directory:
+            root = Path(directory)
+            payload = root / "payload"
+            payload.write_bytes(b"synthetic")
+            marker = root / ".k3s-restic-restore.json"
+            marker.write_bytes(b"{}")
+            marker.chmod(0o600)
+            real_stat, real_lstat = Path.stat, Path.lstat
+            def mapped(path, *, follow_symlinks=True):
+                result = real_stat(path, follow_symlinks=follow_symlinks)
+                if path == marker:
+                    return result
+                values = list(result)
+                values[4] = values[5] = 999
+                return os.stat_result(values)
+            def mapped_link(path):
+                return mapped(path, follow_symlinks=False)
+            with mock.patch.object(Path, "stat", mapped), mock.patch.object(Path, "lstat", mapped_link):
+                maria_published_owner(root, 999, 999)
+            with self.assertRaises(E2EFailure):
+                maria_published_owner(root, 999, 999)
+
+    def test_maria_uid999_cli_case_dispatches_without_container_execution(self):
+        with mock.patch.object(sys.modules[__name__], "inside") as run:
+            self.assertEqual(main(["--inside", "--case", "maria-final-uid999"]), 0)
+            run.assert_called_once_with("maria-final-uid999")
+
     def test_distinct_scratch_and_restore_mounts(self):
         argv = container_args("image", "fixture", "runc", "files")
         for mount in ("/tmp:", "/backup:", "/data:"):
@@ -489,7 +653,7 @@ def main(argv=None):
     parser.add_argument("--runtime", default="runc")
     parser.add_argument("--runtime-reviewed", action="store_true")
     parser.add_argument("--inside", action="store_true")
-    parser.add_argument("--case", choices=("all", "files", "pg16", "pg17", "pg17-uid70", "pg17-vector082", "pg17-physical", "pg17-dual", "mariadb"), default="all")
+    parser.add_argument("--case", choices=("all", "files", "pg16", "pg17", "pg17-uid70", "pg17-vector082", "pg17-physical", "pg17-dual", "mariadb", "maria-final-uid999"), default="all")
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--profile", choices=("lite", "all"), help="Test only scenarios shipped by this image label")
     args = parser.parse_args(argv)

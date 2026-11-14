@@ -823,6 +823,93 @@ def _maria_hash(password):
     return "*" + hashlib.sha1(hashlib.sha1(password.encode()).digest()).hexdigest().upper()
 
 
+def _maria_account_passwords(config):
+    """Explicit exact-account overrides only; connection credentials are not intent.
+
+    PostgreSQL's role-only mapping cannot represent MariaDB user@host and is
+    deliberately rejected rather than silently ignored or broadcast to hosts.
+    """
+    env = _env(config)
+    if "RESTORE_ROLE_PASSWORDS_FILE" in env:
+        _fail("ambiguous_mariadb_password_mapping", "MariaDB requires an explicit user and host account mapping; role-only mappings are not supported")
+    key = "RESTORE_MARIADB_ACCOUNT_PASSWORDS_FILE"
+    if key not in env:
+        return {}
+    filename = env[key]
+    if (not isinstance(filename, str) or not filename or not Path(filename).is_absolute()
+            or "\0" in filename):
+        _fail("invalid_mariadb_password_file", "The MariaDB account mapping must name an absolute private JSON file")
+    try:
+        fd = os.open(filename, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        with os.fdopen(fd, "rb") as stream:
+            before = os.fstat(stream.fileno())
+            if (not stat.S_ISREG(before.st_mode) or stat.S_IMODE(before.st_mode) != 0o600
+                    or before.st_uid != os.geteuid() or before.st_nlink != 1
+                    or not 0 < before.st_size <= 1024 * 1024):
+                _fail("unsafe_mariadb_password_file", "The MariaDB account mapping must be an owner-only mode0600 regular file")
+            raw = stream.read(1024 * 1024 + 1)
+            after = os.fstat(stream.fileno())
+            identity = lambda item: (item.st_dev, item.st_ino, item.st_size, item.st_mtime_ns, item.st_ctime_ns)
+            if identity(before) != identity(after) or len(raw) > 1024 * 1024:
+                _fail("unsafe_mariadb_password_file", "The MariaDB account mapping changed while being read")
+        def pairs(items):
+            value = {}
+            for name, item in items:
+                if name in value:
+                    _fail("invalid_mariadb_password_file", "The MariaDB account mapping contains duplicate fields")
+                value[name] = item
+            return value
+        document = json.loads(raw.decode("utf-8"), object_pairs_hook=pairs)
+    except (OSError, UnicodeError, ValueError, TypeError, RecursionError):
+        _fail("invalid_mariadb_password_file", "The MariaDB account mapping could not be read or decoded")
+    if (not isinstance(document, dict) or set(document) != {"schema_version", "accounts"}
+            or type(document["schema_version"]) is not int or document["schema_version"] != 1
+            or not isinstance(document["accounts"], list) or not 0 < len(document["accounts"]) <= 10000):
+        _fail("invalid_mariadb_password_file", "The MariaDB account mapping schema is invalid")
+    overrides = {}
+    for item in document["accounts"]:
+        if not isinstance(item, dict) or set(item) != {"user", "host", "plugin", "password"}:
+            _fail("invalid_mariadb_password_file", "Every MariaDB override must specify user, host, plugin and password")
+        if any(not isinstance(item[key], str) or not item[key] or any(ord(c) < 32 for c in item[key])
+               for key in ("user", "host")):
+            _fail("invalid_mariadb_password_file", "MariaDB account identities must be explicit nonempty strings")
+        if item["plugin"] != "mysql_native_password":
+            _fail("unsupported_mariadb_auth_override", "Only explicitly selected mysql_native_password overrides are supported")
+        if not isinstance(item["password"], str) or not item["password"] or "\0" in item["password"]:
+            _fail("invalid_mariadb_password_file", "The MariaDB account mapping contains an invalid identity or password")
+        try:
+            identity_size = (len(item["user"].encode("utf-8")), len(item["host"].encode("utf-8")))
+            item["password"].encode("utf-8")
+        except UnicodeError:
+            _fail("invalid_mariadb_password_file", "The MariaDB account mapping contains invalid Unicode text")
+        if identity_size[0] > 128 or identity_size[1] > 255:
+            _fail("invalid_mariadb_password_file", "The MariaDB account mapping contains an invalid identity or password")
+        account = (item["user"], item["host"])
+        if account in overrides:
+            _fail("invalid_mariadb_password_file", "The MariaDB account mapping repeats an account")
+        overrides[account] = item["password"]
+    return overrides
+
+
+def _maria_auth_override(config, options, overrides):
+    """Verify exact imported accounts, then apply and verify only their overrides."""
+    for (user, host), password in overrides.items():
+        where = "BINARY User=" + _maria_literal(user) + " AND BINARY Host=" + _maria_literal(host) + " AND is_role='N'"
+        found = _maria_query(config, options, "SELECT COUNT(*) FROM mysql.user WHERE " + where + ";").stdout.strip()
+        if found != b"1":
+            _fail("unknown_restore_account", "An explicit MariaDB override does not identify one imported login account")
+    for (user, host), password in overrides.items():
+        verifier = _maria_hash(password)
+        _maria_query(config, options, "SET sql_mode=''; ALTER USER " + _maria_account(user, host)
+                     + " IDENTIFIED VIA mysql_native_password USING '" + verifier + "';")
+        where = "BINARY User=" + _maria_literal(user) + " AND BINARY Host=" + _maria_literal(host) + " AND is_role='N'"
+        verified = _maria_query(config, options, "SELECT COUNT(*) FROM mysql.user WHERE " + where
+                                + " AND plugin='mysql_native_password' AND BINARY authentication_string="
+                                + _maria_literal(verifier) + ";").stdout.strip()
+        if verified != b"1":
+            _fail("mariadb_auth_override_mismatch", "An explicit MariaDB authentication override could not be verified")
+
+
 def _option_value(value):
     if "\0" in value:
         _fail("invalid_database_config", "MariaDB connection configuration contains invalid text")
@@ -991,10 +1078,15 @@ def _restore_mariadb(config, stage, target, info):
     accounts = info.get("login_accounts")
     if not isinstance(accounts, list) or any(not isinstance(a, dict) or not isinstance(a.get("user"), str) or not isinstance(a.get("host"), str) for a in accounts):
         _fail("invalid_database_metadata", "MariaDB login account metadata is invalid")
-    passwords = _role_passwords(config)
-    if set(passwords) - {a["user"] for a in accounts}:
-        _fail("unknown_restore_role", "A password mapping references an absent MariaDB account")
+    source_accounts = {(a["user"], a["host"]) for a in accounts}
+    if len(source_accounts) != len(accounts):
+        _fail("invalid_database_metadata", "MariaDB login account metadata contains duplicate identities")
+    overrides = _maria_account_passwords(config)
+    if set(overrides) - source_accounts:
+        _fail("unknown_restore_account", "An explicit password mapping references an absent MariaDB user and host")
     bootstrap = "k3s_restore_" + secrets.token_hex(8)
+    if any(user == bootstrap for user, _ in source_accounts):
+        _fail("restore_bootstrap_collision", "The temporary restore identity conflicts with a source account")
     bootstrap_password = secrets.token_hex(32)
     with _database_access(config, target, "mariadb") as identity, _runtime_dir(identity) as runtime:
         _call(config, _as_database(config, [_maria_bin(config, "install"), "--no-defaults", "--datadir=" + str(target),
@@ -1028,12 +1120,10 @@ def _restore_mariadb(config, stage, target, info):
                         _fail("database_restore_mismatch", "Restored MariaDB charset or collation differs from the snapshot")
                 # Fresh anonymous/passwordless root accounts absent from the
                 # source are removed only after all native import work completes.
-                sql = remove
-                for account in accounts:
-                    if account["user"] in passwords:
-                        sql += "ALTER USER " + _maria_account(account["user"], account["host"]) + " IDENTIFIED VIA mysql_native_password USING '" + _maria_hash(passwords[account["user"]]) + "';\n"
-                sql += "DROP USER " + _maria_account(bootstrap, "localhost") + "; FLUSH TABLES;"
-                _maria_query(config, options, sql)
+                # Native globals own all source plugins, verifiers and grants.
+                # Never turn connection credentials into implicit ALTER USERs.
+                _maria_auth_override(config, options, overrides)
+                _maria_query(config, options, remove + "DROP USER " + _maria_account(bootstrap, "localhost") + "; FLUSH TABLES;")
         _fsync_tree(target)
 
 

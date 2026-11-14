@@ -126,7 +126,7 @@ data:
 
 ## 5. Docker Compose：备份与恢复示例
 
-完整示例见 [Docker Compose 备份/恢复文档](<docs/DOCKER-COMPOSE-EXAMPLE.md>)，包含 lite 文件场景、all + MariaDB 11.8.9、Docker secrets、独立 scratch、自动最新恢复及恢复前停止写入方的流程。生产必须替换示例 digest、仓库和 Secret，不得直接复制示例凭据。
+完整示例见 [Docker Compose 备份/恢复文档](<docs/DOCKER-COMPOSE-EXAMPLE.md>)：lite 文件场景和 all + MariaDB11.8 各含可解析的完整服务图、Docker Secret文件引用、独立restore/backup scratch，以及 `restore-init` 成功后才允许主服务启动的依赖门槛。本镜像已设置Python ENTRYPOINT，因此Compose只写 `command: ["schedule"]` 或 `["restore-init"]`，不要再重复python入口。文档固定已发布v2.0.4 all/lite digest；真实仓库/身份/密码、应用或主数据库镜像digest必须由管理员配置，不能用占位密码。MariaDB示例通过本地Unixsocket使用管理员级账户导出完整globals，普通app.*账号不够；不宣称它是最小权限或11.5旧物理卷可直接恢复。示例及静态测试不是一次实际Compose部署/生产恢复验收。
 
 ## 6. K3s/Kubernetes：init 恢复 + sidecar 备份
 
